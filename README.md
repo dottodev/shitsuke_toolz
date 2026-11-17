@@ -39,7 +39,7 @@ python shitsuke_toolz.py scan file.bin --pattern "48 8B ?? 90"
 shitsuke_toolz.py {banner,recon,elf,metadata,scan,strings,assets,unityfs,skin,alias,resmap,xml,json,gen,adb,shizuku,menu,map,selftest}
 ```
 
-Global flags: `--verbose --json --out DIR --adb PATH --device SERIAL --no-color --dry-run --force`
+Global flags: `--verbose --json --out DIR --adb PATH --device SERIAL --no-color --dry-run --force --selftest`
 
 ## Requirements
 
