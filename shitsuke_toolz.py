@@ -2,19 +2,23 @@
 """shitsuke_toolz — universal developer toolkit for Mobile Legends: Bang Bang.
 
 Single-file, stdlib-first toolkit for Unity/IL2CPP binary recon, asset
-inspection, skin/alias planning, device probing, template emission and
-mod-menu scaffolding. No network access is performed by this tool.
+inspection, skin/alias planning, device probing, template emission, MLBB
+config repacking and file debugging. No network access is performed.
 """
 
 # 00 imports/consts
 import argparse
 import atexit
+import base64
 import binascii
 import csv
+import fnmatch
+import gzip
 import hashlib
 import io
 import json
 import lzma
+import math
 import os
 import re
 import shlex
@@ -28,6 +32,8 @@ import textwrap
 import time
 import traceback
 import xml.etree.ElementTree as ET
+import zipfile
+import zlib
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from string import Template
@@ -55,6 +61,28 @@ BANNER_ART = r"""
 ╚══════╝ ╚═╝  ╚═╝ ╚═╝    ╚═╝    ╚══════╝  ╚═════╝  ╚═╝  ╚═╝ ╚══════╝
 """
 BANNER_LINE = "VIP Toolkit For Devs (beta)"
+
+_BANNER_4X5 = {
+    "S": ("1111", "1000", "1111", "0001", "1111"),
+    "H": ("1001", "1001", "1111", "1001", "1001"),
+    "I": ("1111", "0100", "0100", "0100", "1111"),
+    "T": ("1111", "0100", "0100", "0100", "0100"),
+    "U": ("1001", "1001", "1001", "1001", "1111"),
+    "K": ("1001", "1010", "1100", "1010", "1001"),
+    "E": ("1111", "1000", "1110", "1000", "1111"),
+    "Z": ("1111", "0010", "0100", "1000", "1111"),
+}
+
+
+def compact_banner_lines(text: str) -> List[str]:
+    """Render a narrow block-letter banner without altering BANNER_ART."""
+    rows = [""] * 5
+    for char in text.upper():
+        glyph = _BANNER_4X5.get(char, ("0000",) * 5)
+        for index in range(5):
+            rows[index] += glyph[index].replace("1", "█").replace("0", " ") + " "
+    return [row.rstrip() for row in rows]
+
 
 TARGET_LIBS = ("libil2cpp.so", "liblogic.so", "libmono.so", "libunity.so")
 ABI_DIRS = ("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
@@ -160,9 +188,18 @@ def vlog(subsystem: str, message: str) -> None:
 
 
 def print_banner() -> None:
-    """Print the product banner exactly once per CLI invocation."""
-    sys.stdout.write(BANNER_ART)
-    sys.stdout.write(BANNER_LINE + "\n")
+    """Print the banner, scaling only its layout to fit the terminal width."""
+    cols = max(1, shutil.get_terminal_size(fallback=(80, 24)).columns)
+    full = [line.rstrip() for line in BANNER_ART.strip("\n").splitlines()]
+    full_width = max((len(line) for line in full), default=0)
+    if cols >= full_width + 1:
+        lines = full
+    else:
+        compact = compact_banner_lines("SHITSUKE")
+        lines = compact if cols >= max((len(line) for line in compact), default=0) + 1 else ["█ SHITSUKE █"]
+    for line in lines:
+        sys.stdout.write(line.center(cols).rstrip() + "\n")
+    sys.stdout.write(BANNER_LINE.center(cols).rstrip() + "\n")
     sys.stdout.flush()
 
 
@@ -569,11 +606,6 @@ def make_parser() -> argparse.ArgumentParser:
     sp.add_argument("--code", default=None)
     sp.add_argument("--connect", default=None, metavar="HOST:PORT")
 
-    sp = _sub(sub, "menu", "emit mod menu scaffold",
-              "Emit the LGLTeam-style Android mod menu source tree and per-file manifest.",
-              "shitsuke_toolz.py menu --out ./modmenu", "none (output dir recommended)")
-    sp.add_argument("--pkg", default="com.android.support", help="package root (default com.android.support)")
-
     sp = _sub(sub, "map", "build an analyst surface map",
               "Match keyword file entries against strings, symbols, metadata literals and XML/JSON assets.",
               "shitsuke_toolz.py map --binary libil2cpp.so --keywords keys.txt --out out/", "--binary and --keywords")
@@ -582,6 +614,84 @@ def make_parser() -> argparse.ArgumentParser:
     sp.add_argument("--exact", action="store_true", help="exact case-insensitive match")
     sp.add_argument("--regex", action="store_true", help="regular-expression match")
     sp.add_argument("--frida-emit", action="store_true", dest="frida_emit", help="write a runtime resolver script")
+
+    mlbb_p = _sub(sub, "mlbb", "MLBB config container / XML repack",
+                  "Inspect Documents.unity3d, unpack XML, smart/raw encode, lossless test and ZIP packaging.",
+                  "shitsuke_toolz.py mlbb unpack --all --dest /sdcard/mlbb/decode", "container file")
+    mlbb_sub = mlbb_p.add_subparsers(dest="mlbb_cmd")
+    ap = mlbb_sub.add_parser("inspect", help="list container resources", parents=[_global_parent()])
+    ap.add_argument("input", nargs="?", default=str(MLBB_DEFAULT_IN / MLBB_DEFAULT_CONTAINER))
+    ap = mlbb_sub.add_parser("unpack", help="decode XML resources", parents=[_global_parent()])
+    ap.add_argument("input", nargs="?", default=str(MLBB_DEFAULT_IN / MLBB_DEFAULT_CONTAINER))
+    ap.add_argument("--dest", default=str(MLBB_DEFAULT_OUT), help="directory for decoded XML")
+    ap.add_argument("--all", action="store_true", help="decode every XML resource, not just the default two")
+    ap = mlbb_sub.add_parser("repack", help="smart encode modified XML into a new container", parents=[_global_parent()])
+    ap.add_argument("input", nargs="?", default=str(MLBB_DEFAULT_IN / MLBB_DEFAULT_CONTAINER))
+    ap.add_argument("--dir", dest="source_dir", default=str(MLBB_DEFAULT_OUT), help="decoded XML directory")
+    ap.add_argument("--output", default=str(MLBB_DEFAULT_IN / MLBB_DEFAULT_OUTPUT))
+    ap.add_argument("--zip", dest="zip_name", default=None, help="also write a flashable ZIP with this name")
+    ap.add_argument("--cleanup", action="store_true", help="delete decoded XML after a successful rebuild")
+    ap = mlbb_sub.add_parser("encode", help="raw encode (no base64/gzip/zlib re-apply)", parents=[_global_parent()])
+    ap.add_argument("input", nargs="?", default=str(MLBB_DEFAULT_IN / MLBB_DEFAULT_CONTAINER))
+    ap.add_argument("--dir", dest="source_dir", default=str(MLBB_DEFAULT_OUT))
+    ap.add_argument("--output", default=str(MLBB_DEFAULT_IN / MLBB_DEFAULT_OUTPUT))
+    ap.add_argument("--cleanup", action="store_true", help="delete decoded XML after a successful rebuild")
+    ap = mlbb_sub.add_parser("lossless", help="rebuild without edits and verify byte identity", parents=[_global_parent()])
+    ap.add_argument("input", nargs="?", default=str(MLBB_DEFAULT_IN / MLBB_DEFAULT_CONTAINER))
+    ap.add_argument("--output", default=str(MLBB_DEFAULT_IN / MLBB_DEFAULT_LOSSLESS))
+    ap = mlbb_sub.add_parser("zip", help="wrap Document.unity3d in a flashable ZIP", parents=[_global_parent()])
+    ap.add_argument("bundle", nargs="?", default=str(MLBB_DEFAULT_IN / MLBB_DEFAULT_OUTPUT))
+    ap.add_argument("--name", default=None, help="ZIP name without .zip")
+
+    dbg_p = _sub(sub, "debug", "binary/XML debugging tools",
+                 "Binary diff, entropy map, signature carver and batch XML lint.",
+                 "shitsuke_toolz.py debug entropy Document.unity3d", "subcommand and a file")
+    dbg_sub = dbg_p.add_subparsers(dest="debug_cmd")
+    ap = dbg_sub.add_parser("bindiff", help="byte-level diff with context", parents=[_global_parent()])
+    ap.add_argument("a")
+    ap.add_argument("b")
+    ap.add_argument("--context", type=int, default=16)
+    ap.add_argument("--patch", default=None, metavar="FILE", help="write a JSON patch map")
+    ap = dbg_sub.add_parser("entropy", help="Shannon entropy map", parents=[_global_parent()])
+    ap.add_argument("path")
+    ap.add_argument("--window", type=int, default=256)
+    ap.add_argument("--step", type=int, default=128)
+    ap = dbg_sub.add_parser("carve", help="carve embedded files by signature", parents=[_global_parent()])
+    ap.add_argument("path")
+    ap.add_argument("--dest", default=None, help="extract hits to this directory")
+    ap = dbg_sub.add_parser("xmlcheck", help="validate and lint XML files", parents=[_global_parent()])
+    ap.add_argument("directory", nargs="?", default=str(MLBB_DEFAULT_OUT))
+
+    sp = _sub(sub, "hexdump", "hex reader", "Print an offset/hex/ASCII dump of any file (read-only).",
+              "shitsuke_toolz.py hexdump Documents.unity3d --limit 4096", "file")
+    sp.add_argument("path")
+    sp.add_argument("--limit", type=int, default=4096, help="bytes to show, 0 = all (capped at 1 MiB)")
+
+    sp = _sub(sub, "xmlsearch", "search code in valid XML",
+              "Whitespace-insensitive code search that skips malformed XML automatically.",
+              "shitsuke_toolz.py xmlsearch /sdcard/mlbb/decode --query '<root><value>1</value></root>'",
+              "directory and --query")
+    sp.add_argument("directory", nargs="?", default=str(MLBB_DEFAULT_OUT))
+    sp.add_argument("--query", required=True)
+    sp.add_argument("--max-lines", type=int, default=20, dest="max_lines")
+
+    sp = _sub(sub, "xmlmodify", "modify code in valid XML",
+              "Replace exact snippets in well-formed XML; validates the result before writing.",
+              "shitsuke_toolz.py xmlmodify /sdcard/mlbb/decode --old '1' --new '2' --apply",
+              "directory, --old and --new")
+    sp.add_argument("directory", nargs="?", default=str(MLBB_DEFAULT_OUT))
+    sp.add_argument("--old", required=True)
+    sp.add_argument("--new", default="")
+    sp.add_argument("--apply", action="store_true", help="write changes (default: preview only)")
+
+    sp = _sub(sub, "searchfile", "search files by name or text",
+              "Find files by glob name and/or text content (regex optional), skipping binaries.",
+              "shitsuke_toolz.py searchfile /sdcard/mlbb --name '*.xml' --text cooldown", "root and --name/--text")
+    sp.add_argument("root", nargs="?", default=".")
+    sp.add_argument("--name", default=None, help="glob pattern for filenames")
+    sp.add_argument("--text", default=None, help="text or regex to search inside files")
+    sp.add_argument("--regex", action="store_true", help="treat --text as a regular expression")
+    sp.add_argument("--max", type=int, default=500, help="maximum results")
 
     _sub(sub, "tui", "launch interactive terminal UI",
          "Open the full-screen menu. Running the tool with no arguments does the same.",
@@ -4413,1311 +4523,6 @@ def wireless_adb_action(adb: str, pair: Optional[str] = None, code: Optional[str
             raise DeviceError("adb", out["connect"]["stderr"].strip() or "adb connect failed")
     return out
 
-# 50 mod menu scaffold
-def _menu_manifest_entry(path: str, purpose: str, language: str, deps: List[str], step: str) -> Dict[str, Any]:
-    return {"path": path, "purpose": purpose, "language": language,
-            "dependencies": deps, "build step": step}
-
-
-def emit_mod_menu(out_dir: Union[str, Path], pkg: str = "com.android.support") -> List[Path]:
-    """Emit an LGLTeam-style Android mod menu source tree with a complete manifest."""
-    base = Path(out_dir)
-    pkg = pkg.strip()
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+", pkg):
-        raise UsageError("menu", "invalid package name: %s" % pkg)
-    pkg_path = pkg.replace(".", "/")
-    jni = pkg.replace(".", "_")
-    jroot = "app/src/main/java/%s" % pkg_path
-    files: Dict[str, str] = {}
-
-    files["app/build.gradle"] = '''plugins {
-    id 'com.android.application'
-}
-
-android {
-    namespace '__PKG__'
-    compileSdk 34
-    ndkVersion '26.1.10909125'
-
-    defaultConfig {
-        applicationId '__PKG__'
-        minSdk 21
-        targetSdk 34
-        versionCode 1
-        versionName '1.0'
-        externalNativeBuild {
-            cmake {
-                cppFlags '-std=c++17 -fvisibility=hidden'
-                abiFilters 'arm64-v8a', 'armeabi-v7a'
-            }
-        }
-    }
-
-    externalNativeBuild {
-        cmake {
-            path 'src/main/jni/CMakeLists.txt'
-            version '3.22.1'
-        }
-    }
-
-    compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
-    }
-
-    buildTypes {
-        debug { debuggable true }
-        release {
-            minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-        }
-    }
-}
-'''.replace("__PKG__", pkg)
-
-    files["app/src/main/AndroidManifest.xml"] = '''<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <!-- <uses-permission android:name="android.permission.INTERNET" /> -->
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <application
-        android:label="Shitsuke Toolz"
-        android:allowBackup="false"
-        android:supportsRtl="true">
-        <activity android:name=".MainActivity" android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-        <service
-            android:name=".base.FloatingWindowManager"
-            android:exported="false"
-            android:foregroundServiceType="specialUse" />
-    </application>
-</manifest>
-'''
-
-    files[jroot + "/MainActivity.java"] = '''package __PKG__;
-
-import android.app.Activity;
-import android.content.Intent;
-import android.graphics.Color;
-import android.net.Uri;
-import android.os.Build;
-import android.os.Bundle;
-import android.provider.Settings;
-import android.view.View;
-import android.view.ViewGroup;
-import android.widget.ArrayAdapter;
-import android.widget.Button;
-import android.widget.EditText;
-import android.widget.LinearLayout;
-import android.widget.SeekBar;
-import android.widget.Spinner;
-import android.widget.Switch;
-import android.widget.TextView;
-
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-
-import __PKG__.interfaces.IMenuBuilder;
-import __PKG__.interfaces.IMenuComponentFactory;
-import __PKG__.ThemesData.LGLTheme;
-import __PKG__.base.FloatingWindowManager;
-
-public class MainActivity extends Activity implements IMenuComponentFactory {
-    static {
-        System.loadLibrary("menu");
-    }
-
-    public static native void nativeMenuInit();
-    public static native void nativeMenuSetFeature(String key, boolean enabled);
-    public static native boolean nativeMenuGetFeature(String key);
-    public static native void nativeMenuSetSeek(String key, int value);
-    public static native int nativeMenuGetSeek(String key);
-
-    private final List<Map<String, Object>> entries = new ArrayList<>();
-
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-            Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:" + getPackageName()));
-            startActivity(intent);
-            return;
-        }
-        TextView status = new TextView(this);
-        status.setText("Shitsuke Toolz\\nOverlay permission granted. HUD starts on resume.");
-        status.setTextColor(Color.WHITE);
-        status.setBackgroundColor(Color.rgb(16, 16, 18));
-        status.setPadding(32, 32, 32, 32);
-        setContentView(status);
-        startHud();
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)) {
-            startHud();
-        }
-    }
-
-    private void startHud() {
-        Intent intent = new Intent(this, FloatingWindowManager.class);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent);
-        } else {
-            startService(intent);
-        }
-    }
-
-    @Override
-    public View makeSwitch(String label, boolean value, final BoolCallback callback) {
-        Switch view = new Switch(this);
-        view.setText(label);
-        view.setTextColor(Color.WHITE);
-        view.setChecked(value);
-        view.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(android.widget.CompoundButton buttonView, boolean isChecked) {
-                callback.onChanged(isChecked);
-            }
-        });
-        return view;
-    }
-
-    @Override
-    public View makeSlider(String label, float min, float max, float value, final FloatCallback callback) {
-        LinearLayout group = new LinearLayout(this);
-        group.setOrientation(LinearLayout.VERTICAL);
-        TextView title = new TextView(this);
-        title.setText(label);
-        title.setTextColor(Color.WHITE);
-        SeekBar bar = new SeekBar(this);
-        bar.setMax(1000);
-        bar.setProgress((int) ((value - min) / Math.max(0.0001f, max - min) * 1000.0f));
-        bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                callback.onChanged(min + (max - min) * progress / 1000.0f);
-            }
-            @Override public void onStartTrackingTouch(SeekBar seekBar) { }
-            @Override public void onStopTrackingTouch(SeekBar seekBar) { }
-        });
-        group.addView(title);
-        group.addView(bar);
-        return group;
-    }
-
-    @Override
-    public View makeInput(String label, String value, final StringCallback callback) {
-        LinearLayout group = new LinearLayout(this);
-        group.setOrientation(LinearLayout.VERTICAL);
-        TextView title = new TextView(this);
-        title.setText(label);
-        title.setTextColor(Color.WHITE);
-        EditText edit = new EditText(this);
-        edit.setText(value);
-        edit.setTextColor(Color.WHITE);
-        edit.setHint(label);
-        group.addView(title);
-        group.addView(edit);
-        edit.addTextChangedListener(new android.text.TextWatcher() {
-            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
-            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
-                callback.onChanged(s.toString());
-            }
-            @Override public void afterTextChanged(android.text.Editable s) { }
-        });
-        return group;
-    }
-
-    @Override
-    public View makeButton(String label, final ButtonCallback callback) {
-        Button button = new Button(this);
-        button.setText(label);
-        button.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View view) { callback.onClick(); }
-        });
-        return button;
-    }
-
-    @Override
-    public View makeCategoryHeader(String label) {
-        TextView header = new TextView(this);
-        header.setText(label.toUpperCase());
-        header.setTextColor(Color.rgb(255, 92, 92));
-        header.setPadding(8, 20, 8, 8);
-        return header;
-    }
-
-    @Override
-    public View makeSpinner(String label, String[] values, int selected, final IntCallback callback) {
-        LinearLayout group = new LinearLayout(this);
-        group.setOrientation(LinearLayout.VERTICAL);
-        TextView title = new TextView(this);
-        title.setText(label);
-        title.setTextColor(Color.WHITE);
-        Spinner spinner = new Spinner(this);
-        ArrayAdapter<String> adapter = new ArrayAdapter<String>(this,
-                android.R.layout.simple_spinner_dropdown_item, values);
-        spinner.setAdapter(adapter);
-        spinner.setSelection(Math.max(0, Math.min(selected, values.length - 1)));
-        spinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
-            @Override public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
-                callback.onChanged(position);
-            }
-            @Override public void onNothingSelected(android.widget.AdapterView<?> parent) { }
-        });
-        group.addView(title);
-        group.addView(spinner);
-        return group;
-    }
-
-    @Override
-    public View makeSeekBar(String label, int min, int max, int value, final IntCallback callback) {
-        LinearLayout group = new LinearLayout(this);
-        group.setOrientation(LinearLayout.VERTICAL);
-        TextView title = new TextView(this);
-        title.setText(label + ": " + value);
-        title.setTextColor(Color.WHITE);
-        SeekBar bar = new SeekBar(this);
-        bar.setMax(Math.max(1, max - min));
-        bar.setProgress(value - min);
-        bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                int actual = min + progress;
-                title.setText(label + ": " + actual);
-                callback.onChanged(actual);
-            }
-            @Override public void onStartTrackingTouch(SeekBar seekBar) { }
-            @Override public void onStopTrackingTouch(SeekBar seekBar) { }
-        });
-        group.addView(title);
-        group.addView(bar);
-        return group;
-    }
-
-    @Override
-    public View makeCollapseGroup(String label, View content) {
-        LinearLayout group = new LinearLayout(this);
-        group.setOrientation(LinearLayout.VERTICAL);
-        Button header = new Button(this);
-        header.setText(label);
-        final View body = content;
-        header.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View view) {
-                body.setVisibility(body.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE);
-            }
-        });
-        group.addView(header);
-        group.addView(body);
-        return group;
-    }
-
-    @Override
-    public View makeColorPicker(String label, int color, final IntCallback callback) {
-        LinearLayout group = new LinearLayout(this);
-        group.setOrientation(LinearLayout.HORIZONTAL);
-        TextView title = new TextView(this);
-        title.setText(label);
-        title.setTextColor(Color.WHITE);
-        final EditText hex = new EditText(this);
-        hex.setText(String.format("#%06X", color & 0xFFFFFF));
-        hex.setTextColor(Color.WHITE);
-        hex.addTextChangedListener(new android.text.TextWatcher() {
-            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
-            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
-                try {
-                    callback.onChanged(Color.parseColor(s.toString()));
-                } catch (IllegalArgumentException ignored) {
-                }
-            }
-            @Override public void afterTextChanged(android.text.Editable s) { }
-        });
-        group.addView(title);
-        group.addView(hex, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
-        return group;
-    }
-
-    private final class MenuBuilderImpl implements IMenuBuilder {
-        @Override
-        public void addEntry(String key, String label, String kind, Object value) {
-            Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("key", key);
-            entry.put("label", label);
-            entry.put("kind", kind);
-            entry.put("value", value);
-            entries.add(entry);
-        }
-
-        @Override
-        public List<Map<String, Object>> getEntries() {
-            return entries;
-        }
-    }
-}
-'''.replace("__PKG__", pkg)
-
-    files[jroot + "/Launcher.java"] = '''package __PKG__;
-
-import android.content.Context;
-import android.content.Intent;
-import android.net.Uri;
-import android.os.Build;
-import android.provider.Settings;
-
-import __PKG__.base.FloatingWindowManager;
-
-public final class Launcher {
-    private Launcher() { }
-
-    public static boolean launch(Context context) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(context)) {
-            Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:" + context.getPackageName()));
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            context.startActivity(intent);
-            return false;
-        }
-        Intent service = new Intent(context, FloatingWindowManager.class);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(service);
-        } else {
-            context.startService(service);
-        }
-        return true;
-    }
-}
-'''.replace("__PKG__", pkg)
-
-    files[jroot + "/Preferences.java"] = '''package __PKG__;
-
-import android.content.Context;
-import android.content.SharedPreferences;
-
-public final class Preferences {
-    private final SharedPreferences prefs;
-
-    public Preferences(Context context) {
-        prefs = context.getSharedPreferences("shitsuke", Context.MODE_PRIVATE);
-    }
-
-    public boolean enabled() { return prefs.getBoolean("enabled", true); }
-    public void setEnabled(boolean value) { prefs.edit().putBoolean("enabled", value).apply(); }
-    public boolean stealth() { return prefs.getBoolean("stealth", false); }
-    public void setStealth(boolean value) { prefs.edit().putBoolean("stealth", value).apply(); }
-    public int theme() { return prefs.getInt("theme", 0); }
-    public void setTheme(int value) { prefs.edit().putInt("theme", value).apply(); }
-    public boolean feature(String key, boolean fallback) {
-        return prefs.getBoolean("feature_" + key, fallback);
-    }
-    public void setFeature(String key, boolean value) {
-        prefs.edit().putBoolean("feature_" + key, value).apply();
-    }
-    public int seek(String key, int fallback) {
-        return prefs.getInt("seek_" + key, fallback);
-    }
-    public void setSeek(String key, int value) {
-        prefs.edit().putInt("seek_" + key, value).apply();
-    }
-}
-'''.replace("__PKG__", pkg)
-
-    files[jroot + "/CrashHandler.java"] = '''package __PKG__;
-
-import android.content.Context;
-import android.content.pm.PackageInfo;
-import android.os.Build;
-
-import java.io.File;
-import java.io.FileWriter;
-import java.io.PrintWriter;
-import java.io.StringWriter;
-import java.text.SimpleDateFormat;
-import java.util.Arrays;
-import java.util.Comparator;
-import java.util.Date;
-import java.util.Locale;
-
-public final class CrashHandler implements Thread.UncaughtExceptionHandler {
-    private final Context context;
-    private final Thread.UncaughtExceptionHandler previous;
-
-    public CrashHandler(Context context) {
-        this.context = context.getApplicationContext();
-        this.previous = Thread.getDefaultUncaughtExceptionHandler();
-    }
-
-    public void install() {
-        Thread.setDefaultUncaughtExceptionHandler(this);
-    }
-
-    @Override
-    public void uncaughtException(Thread thread, Throwable error) {
-        try {
-            File dir = new File(context.getExternalFilesDir(null), "LOG_DIR");
-            if (!dir.exists() && !dir.mkdirs()) {
-                throw new IllegalStateException("cannot create crash directory");
-            }
-            String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-            File log = new File(dir, "crash_" + stamp + ".log");
-            PrintWriter out = new PrintWriter(new FileWriter(log, true));
-            out.println("model=" + Build.MODEL);
-            out.println("manufacturer=" + Build.MANUFACTURER);
-            out.println("sdk=" + Build.VERSION.SDK_INT);
-            out.println("abi=" + (Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "unknown"));
-            try {
-                PackageInfo info = context.getPackageManager().getPackageInfo(context.getPackageName(), 0);
-                out.println("app_version=" + info.versionName + " (" + info.versionCode + ")");
-            } catch (Exception ignored) {
-                out.println("app_version=unknown");
-            }
-            out.println("thread=" + thread.getName());
-            StringWriter buffer = new StringWriter();
-            error.printStackTrace(new PrintWriter(buffer));
-            out.println(buffer.toString());
-            out.close();
-            prune(dir);
-        } catch (Exception ignored) {
-        }
-        if (previous != null) {
-            previous.uncaughtException(thread, error);
-        } else {
-            android.os.Process.killProcess(android.os.Process.myPid());
-            System.exit(1);
-        }
-    }
-
-    private void prune(File dir) {
-        File[] logs = dir.listFiles();
-        if (logs == null || logs.length <= 5) {
-            return;
-        }
-        Arrays.sort(logs, new Comparator<File>() {
-            @Override public int compare(File a, File b) {
-                return Long.compare(a.lastModified(), b.lastModified());
-            }
-        });
-        for (int i = 0; i < logs.length - 5; i++) {
-            if (!logs[i].delete()) {
-                logs[i].deleteOnExit();
-            }
-        }
-    }
-}
-'''.replace("__PKG__", pkg)
-
-    files[jroot + "/base/IFloatingBuilder.java"] = '''package __PKG__.base;
-
-public interface IFloatingBuilder {
-    void buildBubble();
-    void buildExpandedMenu();
-    void show();
-    void hide();
-    boolean isShowing();
-}
-'''.replace("__PKG__", pkg)
-
-    files[jroot + "/base/FloatingWindowManager.java"] = '''package __PKG__.base;
-
-import android.app.Notification;
-import android.app.NotificationChannel;
-import android.app.NotificationManager;
-import android.app.PendingIntent;
-import android.app.Service;
-import android.content.Context;
-import android.content.Intent;
-import android.content.res.Configuration;
-import android.graphics.Color;
-import android.graphics.PixelFormat;
-import android.graphics.drawable.GradientDrawable;
-import android.os.Build;
-import android.os.IBinder;
-import android.util.DisplayMetrics;
-import android.view.Gravity;
-import android.view.MotionEvent;
-import android.view.View;
-import android.view.WindowManager;
-import android.widget.Button;
-import android.widget.LinearLayout;
-import android.widget.SeekBar;
-import android.widget.Switch;
-import android.widget.TextView;
-
-import __PKG__.MainActivity;
-import __PKG__.Preferences;
-
-public class FloatingWindowManager extends Service implements IFloatingBuilder {
-    public static final String ACTION_RESTORE = "__PKG__.RESTORE";
-    private static final String CHANNEL = "shitsuke_hud";
-    private static final int NOTIFICATION_ID = 0x5A17;
-
-    private WindowManager windowManager;
-    private WindowManager.LayoutParams bubbleParams;
-    private WindowManager.LayoutParams panelParams;
-    private View bubble;
-    private View panel;
-    private boolean expanded;
-    private boolean stealth;
-    private int bubbleX = 24;
-    private int bubbleY = 180;
-    private Preferences preferences;
-
-    @Override
-    public void onCreate() {
-        super.onCreate();
-        preferences = new Preferences(this);
-        createChannel();
-        startForeground(NOTIFICATION_ID, buildNotification());
-        windowManager = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
-        buildBubble();
-        buildExpandedMenu();
-        show();
-    }
-
-    @Override
-    public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null && ACTION_RESTORE.equals(intent.getAction())) {
-            setStealth(false);
-        }
-        return START_STICKY;
-    }
-
-    @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
-
-    @Override
-    public void buildBubble() {
-        TextView button = new TextView(this);
-        button.setText("ST");
-        button.setTextColor(Color.WHITE);
-        button.setTextSize(12);
-        button.setGravity(Gravity.CENTER);
-        GradientDrawable shape = new GradientDrawable();
-        shape.setShape(GradientDrawable.OVAL);
-        shape.setColor(Color.rgb(196, 30, 58));
-        shape.setStroke(2, Color.rgb(255, 210, 210));
-        button.setBackground(shape);
-        int size = dp(46);
-        bubble = button;
-        int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                : WindowManager.LayoutParams.TYPE_PHONE;
-        bubbleParams = new WindowManager.LayoutParams(size, size, type,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                PixelFormat.TRANSLUCENT);
-        bubbleParams.gravity = Gravity.TOP | Gravity.START;
-        bubbleParams.x = bubbleX;
-        bubbleParams.y = bubbleY;
-        button.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View view) {
-                expanded = !expanded;
-                if (panel != null) {
-                    panel.setVisibility(expanded ? View.VISIBLE : View.GONE);
-                }
-            }
-        });
-        button.setOnTouchListener(new View.OnTouchListener() {
-            private int downX;
-            private int downY;
-            private float touchX;
-            private float touchY;
-            @Override
-            public boolean onTouch(View view, MotionEvent event) {
-                switch (event.getActionMasked()) {
-                    case MotionEvent.ACTION_DOWN:
-                        downX = bubbleParams.x;
-                        downY = bubbleParams.y;
-                        touchX = event.getRawX();
-                        touchY = event.getRawY();
-                        return false;
-                    case MotionEvent.ACTION_MOVE:
-                        bubbleX = downX + (int) (event.getRawX() - touchX);
-                        bubbleY = downY + (int) (event.getRawY() - touchY);
-                        clamp();
-                        bubbleParams.x = bubbleX;
-                        bubbleParams.y = bubbleY;
-                        if (windowManager != null && bubble != null) {
-                            windowManager.updateViewLayout(bubble, bubbleParams);
-                        }
-                        return true;
-                    default:
-                        return false;
-                }
-            }
-        });
-    }
-
-    @Override
-    public void buildExpandedMenu() {
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(14), dp(14), dp(14), dp(14));
-        GradientDrawable background = new GradientDrawable();
-        background.setColor(Color.argb(235, 18, 18, 22));
-        background.setCornerRadius(dp(12));
-        background.setStroke(1, Color.rgb(196, 30, 58));
-        root.setBackground(background);
-
-        TextView title = new TextView(this);
-        title.setText("SHITSUKE TOOLZ");
-        title.setTextColor(Color.rgb(255, 92, 92));
-        title.setTextSize(15);
-        root.addView(title);
-
-        root.addView(featureSwitch("aim_assist", "Aim assist", false));
-        root.addView(featureSwitch("esp", "ESP overlay", false));
-        root.addView(featureSwitch("cooldown", "Cooldown clamp", false));
-        root.addView(seekRow("fov", "FOV", 30, 180, 90));
-
-        Button hide = new Button(this);
-        hide.setText("HIDE");
-        hide.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View view) {
-                if (panel != null) {
-                    panel.setVisibility(View.GONE);
-                }
-                expanded = false;
-            }
-        });
-        root.addView(hide);
-
-        Button secure = new Button(this);
-        secure.setText("STEALTH");
-        secure.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View view) {
-                setStealth(!stealth);
-            }
-        });
-        root.addView(secure);
-
-        int width = Math.min(dp(240), screenWidth() - dp(24));
-        panel = root;
-        int type = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                : WindowManager.LayoutParams.TYPE_PHONE;
-        panelParams = new WindowManager.LayoutParams(width, WindowManager.LayoutParams.WRAP_CONTENT, type,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                PixelFormat.TRANSLUCENT);
-        panelParams.gravity = Gravity.TOP | Gravity.START;
-        panelParams.x = Math.max(0, screenWidth() - width - dp(12));
-        panelParams.y = dp(80);
-        panel.setVisibility(View.GONE);
-    }
-
-    private View featureSwitch(final String key, String label, boolean fallback) {
-        Switch toggle = new Switch(this);
-        toggle.setText(label);
-        toggle.setTextColor(Color.WHITE);
-        toggle.setChecked(preferences.feature(key, fallback));
-        toggle.setOnCheckedChangeListener(new android.widget.CompoundButton.OnCheckedChangeListener() {
-            @Override public void onCheckedChanged(android.widget.CompoundButton buttonView, boolean isChecked) {
-                preferences.setFeature(key, isChecked);
-                MainActivity.nativeMenuSetFeature(key, isChecked);
-            }
-        });
-        return toggle;
-    }
-
-    private View seekRow(final String key, String label, final int min, final int max, int fallback) {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.VERTICAL);
-        TextView caption = new TextView(this);
-        int value = preferences.seek(key, fallback);
-        caption.setText(label + ": " + value);
-        caption.setTextColor(Color.WHITE);
-        SeekBar bar = new SeekBar(this);
-        bar.setMax(max - min);
-        bar.setProgress(Math.max(0, Math.min(value - min, max - min)));
-        bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                int actual = min + progress;
-                caption.setText(label + ": " + actual);
-                preferences.setSeek(key, actual);
-                MainActivity.nativeMenuSetSeek(key, actual);
-            }
-            @Override public void onStartTrackingTouch(SeekBar seekBar) { }
-            @Override public void onStopTrackingTouch(SeekBar seekBar) { }
-        });
-        row.addView(caption);
-        row.addView(bar);
-        return row;
-    }
-
-    @Override
-    public void show() {
-        if (windowManager == null) {
-            return;
-        }
-        if (bubble != null && bubble.getParent() == null) {
-            windowManager.addView(bubble, bubbleParams);
-        }
-        if (panel != null && panel.getParent() == null) {
-            windowManager.addView(panel, panelParams);
-        }
-    }
-
-    @Override
-    public void hide() {
-        if (windowManager == null) {
-            return;
-        }
-        if (bubble != null && bubble.getParent() != null) {
-            windowManager.removeView(bubble);
-        }
-        if (panel != null && panel.getParent() != null) {
-            windowManager.removeView(panel);
-        }
-    }
-
-    @Override
-    public boolean isShowing() {
-        return bubble != null && bubble.getParent() != null;
-    }
-
-    public void setStealth(boolean enabled) {
-        stealth = enabled;
-        if (panelParams != null) {
-            if (enabled) {
-                panelParams.flags |= WindowManager.LayoutParams.FLAG_SECURE;
-            } else {
-                panelParams.flags &= ~WindowManager.LayoutParams.FLAG_SECURE;
-            }
-            if (windowManager != null && panel != null && panel.getParent() != null) {
-                windowManager.updateViewLayout(panel, panelParams);
-            }
-        }
-        startForeground(NOTIFICATION_ID, buildNotification());
-    }
-
-    @Override
-    public void onConfigurationChanged(Configuration newConfig) {
-        super.onConfigurationChanged(newConfig);
-        clamp();
-        if (bubbleParams != null && bubble != null && windowManager != null && bubble.getParent() != null) {
-            windowManager.updateViewLayout(bubble, bubbleParams);
-        }
-        if (panelParams != null && panel != null && windowManager != null && panel.getParent() != null) {
-            int width = Math.min(dp(240), screenWidth() - dp(24));
-            panelParams.width = width;
-            panelParams.x = Math.max(0, Math.min(panelParams.x, screenWidth() - width));
-            panelParams.y = Math.max(0, Math.min(panelParams.y, screenHeight() - dp(80)));
-            windowManager.updateViewLayout(panel, panelParams);
-        }
-    }
-
-    private void clamp() {
-        int width = screenWidth();
-        int height = screenHeight();
-        int bubbleSize = bubble == null ? dp(46) : bubble.getWidth();
-        if (bubbleSize <= 0) {
-            bubbleSize = dp(46);
-        }
-        bubbleX = Math.max(0, Math.min(bubbleX, width - bubbleSize));
-        bubbleY = Math.max(0, Math.min(bubbleY, height - bubbleSize));
-        if (bubbleParams != null) {
-            bubbleParams.x = bubbleX;
-            bubbleParams.y = bubbleY;
-        }
-    }
-
-    private int screenWidth() {
-        DisplayMetrics metrics = new DisplayMetrics();
-        if (windowManager != null) {
-            windowManager.getDefaultDisplay().getRealMetrics(metrics);
-        }
-        return metrics.widthPixels;
-    }
-
-    private int screenHeight() {
-        DisplayMetrics metrics = new DisplayMetrics();
-        if (windowManager != null) {
-            windowManager.getDefaultDisplay().getRealMetrics(metrics);
-        }
-        return metrics.heightPixels;
-    }
-
-    private int dp(int value) {
-        return Math.round(value * getResources().getDisplayMetrics().density);
-    }
-
-    private void createChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-            NotificationChannel channel = new NotificationChannel(CHANNEL, "Shitsuke HUD",
-                    NotificationManager.IMPORTANCE_LOW);
-            channel.setDescription("Overlay service status");
-            manager.createNotificationChannel(channel);
-        }
-    }
-
-    private Notification buildNotification() {
-        Intent restore = new Intent(this, FloatingWindowManager.class);
-        restore.setAction(ACTION_RESTORE);
-        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            flags |= PendingIntent.FLAG_IMMUTABLE;
-        }
-        PendingIntent pending = PendingIntent.getService(this, 7, restore, flags);
-        Notification.Builder builder;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            builder = new Notification.Builder(this, CHANNEL);
-        } else {
-            builder = new Notification.Builder(this);
-        }
-        builder.setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setContentTitle("Shitsuke Toolz")
-                .setContentText(stealth ? "Stealth mode active" : "HUD overlay active")
-                .setOngoing(true)
-                .addAction(new Notification.Action.Builder(
-                        android.R.drawable.ic_menu_view, "Restore overlay", pending).build());
-        return builder.build();
-    }
-
-    @Override
-    public void onDestroy() {
-        hide();
-        super.onDestroy();
-    }
-}
-'''.replace("__PKG__", pkg)
-
-    files[jroot + "/interfaces/IMenuBuilder.java"] = '''package __PKG__.interfaces;
-
-import java.util.List;
-import java.util.Map;
-
-public interface IMenuBuilder {
-    void addEntry(String key, String label, String kind, Object value);
-    List<Map<String, Object>> getEntries();
-}
-'''.replace("__PKG__", pkg)
-
-    files[jroot + "/interfaces/IMenuComponentFactory.java"] = '''package __PKG__.interfaces;
-
-import android.view.View;
-
-public interface IMenuComponentFactory {
-    interface BoolCallback { void onChanged(boolean value); }
-    interface FloatCallback { void onChanged(float value); }
-    interface StringCallback { void onChanged(String value); }
-    interface IntCallback { void onChanged(int value); }
-    interface ButtonCallback { void onClick(); }
-
-    View makeSwitch(String label, boolean value, BoolCallback callback);
-    View makeSlider(String label, float min, float max, float value, FloatCallback callback);
-    View makeInput(String label, String value, StringCallback callback);
-    View makeButton(String label, ButtonCallback callback);
-    View makeCategoryHeader(String label);
-    View makeSpinner(String label, String[] values, int selected, IntCallback callback);
-    View makeSeekBar(String label, int min, int max, int value, IntCallback callback);
-    View makeCollapseGroup(String label, View content);
-    View makeColorPicker(String label, int color, IntCallback callback);
-}
-'''.replace("__PKG__", pkg)
-
-    files[jroot + "/ThemesData/LGLTheme.java"] = '''package __PKG__.ThemesData;
-
-import android.graphics.Color;
-
-public class LGLTheme {
-    public final int backgroundColor = Color.argb(235, 18, 18, 22);
-    public final int panelColor = Color.argb(245, 26, 26, 31);
-    public final int textColor = Color.WHITE;
-    public final int mutedTextColor = Color.rgb(174, 174, 184);
-    public final int accentColor = Color.rgb(255, 92, 92);
-    public final int trackColor = Color.rgb(70, 70, 78);
-    public final int switchOnColor = Color.rgb(196, 30, 58);
-    public final float cornerRadius = 12.0f;
-    public final float itemRadius = 8.0f;
-    public final String fontFamily = "sans-serif-condensed";
-    public final int padding = 14;
-    public final int itemSpacing = 8;
-    public final int headerTextSize = 15;
-    public final int bodyTextSize = 13;
-}
-'''.replace("__PKG__", pkg)
-
-    files[jroot + "/ThemesData/DZTheme.java"] = '''package __PKG__.ThemesData;
-
-import android.graphics.Color;
-
-public class DZTheme {
-    public final int backgroundColor = Color.argb(240, 8, 12, 16);
-    public final int panelColor = Color.argb(250, 14, 22, 30);
-    public final int textColor = Color.rgb(230, 245, 255);
-    public final int mutedTextColor = Color.rgb(140, 168, 184);
-    public final int accentColor = Color.rgb(0, 200, 255);
-    public final int trackColor = Color.rgb(36, 58, 72);
-    public final int switchOnColor = Color.rgb(0, 160, 210);
-    public final float cornerRadius = 4.0f;
-    public final float itemRadius = 3.0f;
-    public final String fontFamily = "monospace";
-    public final int padding = 12;
-    public final int itemSpacing = 6;
-    public final int headerTextSize = 14;
-    public final int bodyTextSize = 12;
-}
-'''.replace("__PKG__", pkg)
-
-    files["app/src/main/jni/CMakeLists.txt"] = '''cmake_minimum_required(VERSION 3.22.1)
-project(shitsuke_menu CXX)
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-add_library(menu SHARED
-        Main.cpp
-        Menu/Menu.cpp)
-
-target_include_directories(menu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(menu log android)
-'''
-
-    files["app/src/main/jni/Includes/Macros.h"] = '''#pragma once
-
-#define SHITSUKE_TAG "ShitsukeMenu"
-#define SHITSUKE_LOG(...) __android_log_print(ANDROID_LOG_INFO, SHITSUKE_TAG, __VA_ARGS__)
-#define SHITSUKE_UNUSED(x) (void)(x)
-#define SHITSUKE_EXPORT extern "C" __attribute__((visibility("default")))
-'''
-
-    files["app/src/main/jni/Includes/Utils.h"] = '''#pragma once
-
-#include <jni.h>
-#include <android/log.h>
-#include <cstddef>
-#include <cstdint>
-#include <string>
-
-#include "Macros.h"
-
-extern "C" {
-void* xdl_open(const char* name, int flags);
-void* xdl_sym(void* handle, const char* symbol, void* caller);
-int xdl_close(void* handle);
-int DobbyHook(void* address, void* replace, void** origin);
-int DobbyDestroy(void* address);
-}
-
-namespace KittyMemory {
-bool patchMemory(void* address, const void* data, size_t size);
-bool restoreMemory(void* address, const void* original, size_t size);
-int getProtection(void* address);
-}
-
-namespace shitsuke {
-inline std::string obfuscate(const char* text) {
-    std::string out(text == nullptr ? "" : text);
-    for (size_t i = 0; i < out.size(); i++) {
-        out[i] = static_cast<char>(out[i] ^ static_cast<char>(0x5A + (i & 7)));
-    }
-    return out;
-}
-
-inline void log(const char* message) {
-    __android_log_print(ANDROID_LOG_INFO, SHITSUKE_TAG, "%s", message);
-}
-}
-
-#define AY_OBFUSCATE(text) shitsuke::obfuscate(text)
-'''
-
-    files["app/src/main/jni/Menu/Menu.h"] = '''#pragma once
-
-#include <jni.h>
-
-bool menuInit();
-void menuSetFeature(const char* key, bool enabled);
-bool menuGetFeature(const char* key);
-void menuSetSeek(const char* key, int value);
-int menuGetSeek(const char* key);
-bool install_hooks();
-void remove_hooks();
-'''
-
-    files["app/src/main/jni/Menu/Menu.cpp"] = '''#include "Menu.h"
-#include "Includes/Utils.h"
-
-#include <mutex>
-#include <string>
-#include <unordered_map>
-
-namespace {
-std::mutex g_mutex;
-std::unordered_map<std::string, bool> g_features;
-std::unordered_map<std::string, int> g_seeks;
-void* g_library = nullptr;
-void* g_target = nullptr;
-void* g_original = nullptr;
-
-void hook_dispatch(void* self) {
-    // TODO: business logic
-    reinterpret_cast<void (*)(void*)>(g_original)(self);
-}
-}  // namespace
-
-bool menuInit() {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_features["aim_assist"] = false;
-    g_features["esp"] = false;
-    g_features["cooldown"] = false;
-    g_seeks["fov"] = 90;
-    return true;
-}
-
-void menuSetFeature(const char* key, bool enabled) {
-    if (key == nullptr) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_features[std::string(key)] = enabled;
-}
-
-bool menuGetFeature(const char* key) {
-    if (key == nullptr) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(g_mutex);
-    auto it = g_features.find(std::string(key));
-    return it != g_features.end() && it->second;
-}
-
-void menuSetSeek(const char* key, int value) {
-    if (key == nullptr) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_seeks[std::string(key)] = value;
-}
-
-int menuGetSeek(const char* key) {
-    if (key == nullptr) {
-        return 0;
-    }
-    std::lock_guard<std::mutex> lock(g_mutex);
-    auto it = g_seeks.find(std::string(key));
-    return it == g_seeks.end() ? 0 : it->second;
-}
-
-bool install_hooks() {
-    g_library = xdl_open(AY_OBFUSCATE("libil2cpp.so").c_str(), 0);
-    if (g_library == nullptr) {
-        shitsuke::log("target library not loaded");
-        return false;
-    }
-    g_target = xdl_sym(g_library, AY_OBFUSCATE("il2cpp_init").c_str(), nullptr);
-    if (g_target == nullptr) {
-        shitsuke::log("target symbol not found");
-        return false;
-    }
-    int result = DobbyHook(g_target, reinterpret_cast<void*>(hook_dispatch), &g_original);
-    return result == 0;
-}
-
-void remove_hooks() {
-    if (g_target != nullptr) {
-        DobbyDestroy(g_target);
-        g_target = nullptr;
-    }
-    if (g_library != nullptr) {
-        xdl_close(g_library);
-        g_library = nullptr;
-    }
-}
-'''
-
-    files["app/src/main/jni/Main.cpp"] = '''#include <jni.h>
-
-#include "Menu/Menu.h"
-#include "Includes/Macros.h"
-#include "Includes/Utils.h"
-
-SHITSUKE_EXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
-    SHITSUKE_UNUSED(reserved);
-    JNIEnv* env = nullptr;
-    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
-        return JNI_ERR;
-    }
-    menuInit();
-    if (!install_hooks()) {
-        shitsuke::log("JNI_OnLoad: hook installation failed");
-    }
-    return JNI_VERSION_1_6;
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java___JNI___MainActivity_nativeMenuInit(JNIEnv* env, jclass clazz) {
-    SHITSUKE_UNUSED(env);
-    SHITSUKE_UNUSED(clazz);
-    return menuInit() ? JNI_TRUE : JNI_FALSE;
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java___JNI___MainActivity_nativeMenuSetFeature(JNIEnv* env, jclass clazz, jstring key, jboolean enabled) {
-    SHITSUKE_UNUSED(clazz);
-    if (key == nullptr) {
-        return;
-    }
-    const char* text = env->GetStringUTFChars(key, nullptr);
-    menuSetFeature(text, enabled == JNI_TRUE);
-    env->ReleaseStringUTFChars(key, text);
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java___JNI___MainActivity_nativeMenuGetFeature(JNIEnv* env, jclass clazz, jstring key) {
-    SHITSUKE_UNUSED(clazz);
-    if (key == nullptr) {
-        return JNI_FALSE;
-    }
-    const char* text = env->GetStringUTFChars(key, nullptr);
-    bool result = menuGetFeature(text);
-    env->ReleaseStringUTFChars(key, text);
-    return result ? JNI_TRUE : JNI_FALSE;
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java___JNI___MainActivity_nativeMenuSetSeek(JNIEnv* env, jclass clazz, jstring key, jint value) {
-    SHITSUKE_UNUSED(clazz);
-    if (key == nullptr) {
-        return;
-    }
-    const char* text = env->GetStringUTFChars(key, nullptr);
-    menuSetSeek(text, static_cast<int>(value));
-    env->ReleaseStringUTFChars(key, text);
-}
-
-extern "C" JNIEXPORT jint JNICALL
-Java___JNI___MainActivity_nativeMenuGetSeek(JNIEnv* env, jclass clazz, jstring key) {
-    SHITSUKE_UNUSED(clazz);
-    if (key == nullptr) {
-        return 0;
-    }
-    const char* text = env->GetStringUTFChars(key, nullptr);
-    int result = menuGetSeek(text);
-    env->ReleaseStringUTFChars(key, text);
-    return static_cast<jint>(result);
-}
-'''.replace("__JNI__", jni)
-
-    files["app/src/main/jni/KittyMemory/README"] = '''KittyMemory is not vendored by this generator.
-
-Add the KittyMemory headers and sources used by your build:
-  KittyMemory/KittyMemory.hpp
-  KittyMemory/MemoryPatch.hpp
-  KittyMemory/KittyMemory.cpp
-  KittyMemory/MemoryPatch.cpp
-
-Utils.h declares the subset used by this scaffold:
-  KittyMemory::patchMemory
-  KittyMemory::restoreMemory
-  KittyMemory::getProtection
-
-Dobby and xDL are likewise external dependencies. Add their static/shared
-libraries to CMakeLists.txt and link them into the `menu` target. The generator
-emits source only; it does not compile or download native dependencies.
-'''
-
-    notes = '''# Shitsuke Toolz Mod Menu Build Notes
-
-## Prerequisites
-- Android Studio with Android SDK 34 and build-tools.
-- Android NDK 26.1.10909125 (or change ndkVersion in app/build.gradle).
-- CMake 3.22.1.
-- minSdk 21; targetSdk 34.
-
-## Configure the target
-- Set the applicationId in app/build.gradle. The default package root is
-  com.android.support. This intentionally collides with legacy Android support
-  libraries; do not add androidx/support dependencies to this module.
-- Set the target library and symbol in app/src/main/jni/Menu/Menu.cpp
-  (`libil2cpp.so`, `il2cpp_init`).
-- Add hook logic on the single `// TODO: business logic` line.
-- Add features by extending the maps in Menu.cpp and adding JNI declarations
-  in Main.cpp only when exposing a new native entry point.
-- Patch/restore bytes with KittyMemory::patchMemory / restoreMemory.
-- Resolve modules and symbols with xdl_open / xdl_sym / xdl_close.
-- Resolve target exports with DobbyHook / DobbyDestroy.
-
-## Build
-- Debug:   ./gradlew :app:assembleDebug
-- Release: ./gradlew :app:assembleRelease
-- Native only: cmake --build app/.cxx/... (configure through Gradle first).
-
-This tool emits source files only. It does not compile, sign, or install the
-APK, and it does not download native dependencies.
-'''
-    files["BUILD_NOTES.md"] = notes
-
-    manifest: List[Dict[str, Any]] = []
-    purposes = {
-        "app/build.gradle": ("Android application build configuration", "gradle", [], "gradle :app:assembleDebug"),
-        "app/src/main/AndroidManifest.xml": ("Overlay service manifest and permissions", "xml", ["app/build.gradle"], "gradle :app:assembleDebug"),
-        jroot + "/MainActivity.java": ("Overlay permission gate and menu component factory", "java", ["app/src/main/AndroidManifest.xml"], "gradle :app:assembleDebug"),
-        jroot + "/Launcher.java": ("Programmatic HUD launcher", "java", [jroot + "/MainActivity.java"], "gradle :app:assembleDebug"),
-        jroot + "/Preferences.java": ("Persistent feature/seek/stealth settings", "java", [], "gradle :app:assembleDebug"),
-        jroot + "/CrashHandler.java": ("Crash log rotation (last 5)", "java", [], "gradle :app:assembleDebug"),
-        jroot + "/base/IFloatingBuilder.java": ("Overlay builder contract", "java", [], "gradle :app:assembleDebug"),
-        jroot + "/base/FloatingWindowManager.java": ("Foreground overlay service, draggable HUD, stealth mode", "java", [jroot + "/Preferences.java", jroot + "/MainActivity.java"], "gradle :app:assembleDebug"),
-        jroot + "/interfaces/IMenuBuilder.java": ("Menu entry collector contract", "java", [], "gradle :app:assembleDebug"),
-        jroot + "/interfaces/IMenuComponentFactory.java": ("One factory method per menu component", "java", [], "gradle :app:assembleDebug"),
-        jroot + "/ThemesData/LGLTheme.java": ("LGL color/radius/font/padding theme", "java", [], "gradle :app:assembleDebug"),
-        jroot + "/ThemesData/DZTheme.java": ("DZ color/radius/font/padding theme", "java", [], "gradle :app:assembleDebug"),
-        "app/src/main/jni/CMakeLists.txt": ("Native menu module build", "cmake", ["app/build.gradle"], "gradle :app:assembleDebug"),
-        "app/src/main/jni/Main.cpp": ("JNI_OnLoad and menu JNI entry points", "cpp", ["app/src/main/jni/Menu/Menu.cpp"], "gradle :app:assembleDebug"),
-        "app/src/main/jni/Menu/Menu.cpp": ("Feature maps, target resolution and hook lifecycle", "cpp", ["app/src/main/jni/Menu/Menu.h"], "gradle :app:assembleDebug"),
-        "app/src/main/jni/Menu/Menu.h": ("Menu native API declarations", "cpp", [], "gradle :app:assembleDebug"),
-        "app/src/main/jni/Includes/Utils.h": ("xDL, Dobby, KittyMemory declarations and obfuscator", "cpp", [], "gradle :app:assembleDebug"),
-        "app/src/main/jni/Includes/Macros.h": ("Logging/export macros", "cpp", [], "gradle :app:assembleDebug"),
-        "app/src/main/jni/KittyMemory/README": ("External KittyMemory dependency notes", "text", [], "manual dependency setup"),
-        "BUILD_NOTES.md": ("Build and customization notes", "markdown", [], "none"),
-    }
-    for rel, content in files.items():
-        purpose, language, deps, step = purposes.get(rel, ("Mod menu scaffold", "text", [], "gradle"))
-        manifest.append(_menu_manifest_entry(rel, purpose, language, deps, step))
-    manifest.append(_menu_manifest_entry("manifest.json", "Per-file scaffold inventory", "json", [], "none"))
-    files["manifest.json"] = json.dumps(manifest, indent=2) + "\n"
-
-    for rel, content in files.items():
-        if rel.endswith(".json"):
-            try:
-                json.loads(content)
-            except json.JSONDecodeError as exc:
-                raise ParseError("menu", "invalid generated JSON %s: %s" % (rel, exc))
-        elif rel.endswith(".xml"):
-            try:
-                ET.fromstring(content)
-            except ET.ParseError as exc:
-                raise ParseError("menu", "invalid generated XML %s: %s" % (rel, exc))
-        elif rel.endswith(".cpp") or rel.endswith(".h"):
-            ok, msg = validate_cpp(content)
-            if not ok:
-                raise ParseError("menu", "invalid generated C++ %s: %s" % (rel, msg))
-        elif rel.endswith(".java"):
-            stripped = _strip_c_like(content)
-            ok, msg = _bracket_check(stripped, "menu")
-            if not ok:
-                raise ParseError("menu", "invalid generated Java %s: %s" % (rel, msg))
-
-    written: List[Path] = []
-    for rel, content in files.items():
-        path = base / rel
-        atomic_write(path, content.encode("utf-8"))
-        written.append(path)
-    return written
-
 # 60 surface map
 MAP_SOURCE_WEIGHTS = {"symbol": 3.0, "metadata": 3.0, "asset": 2.0, "string": 1.0}
 MAP_MAX_ASSET_BYTES = 16 * 1024 * 1024
@@ -6022,6 +4827,689 @@ setImmediate(function () {
     target = Path(path)
     atomic_write(target, source.encode("utf-8"))
     return target
+
+# 26 MLBB config container
+MLBB_MAGIC = b"MLBB"
+MLBB_DEFAULT_IN = Path("/storage/emulated/0/mlbb/encode")
+MLBB_DEFAULT_OUT = Path("/storage/emulated/0/mlbb/decode")
+MLBB_DEFAULT_CONTAINER = "Documents.unity3d"
+MLBB_DEFAULT_OUTPUT = "Document.unity3d"
+MLBB_DEFAULT_LOSSLESS = "Document_lossless.unity3d"
+MLBB_WANTED_XML = ("BattleSystemConfig.xml", "SystemConfig.xml")
+MLBB_ZIP_ROOT = "files/dragon2017/assets/Document/android"
+MLBB_DECODE_LIMIT = 8
+
+
+def mlbb_read_u32(data: bytes, pos: int, subsystem: str = "mlbb") -> Tuple[int, int]:
+    if pos < 0 or pos + 4 > len(data):
+        raise ParseError(subsystem, "unexpected EOF at 0x%x" % pos)
+    return struct.unpack_from("<I", data, pos)[0], pos + 4
+
+
+def mlbb_parse(data: bytes) -> Tuple[int, List[Dict[str, Any]]]:
+    """Parse an MLBB resource container into its payload base and resource table."""
+    if len(data) < 8 or data[:4] != MLBB_MAGIC:
+        raise ParseError("mlbb", "not an MLBB container (bad magic)")
+    count, pos = mlbb_read_u32(data, 4)
+    if count > 100000:
+        raise ParseError("mlbb", "implausible resource count: %d" % count)
+    resources: List[Dict[str, Any]] = []
+    for index in range(count):
+        name_len, pos = mlbb_read_u32(data, pos)
+        if name_len == 0 or pos + name_len > len(data):
+            raise ParseError("mlbb", "resource %d: invalid name length" % index)
+        try:
+            name = data[pos:pos + name_len].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ParseError("mlbb", "resource %d: bad name: %s" % (index, exc)) from exc
+        pos += name_len
+        size, pos = mlbb_read_u32(data, pos)
+        offset, pos = mlbb_read_u32(data, pos)
+        if name in (".", "..") or "\x00" in name:
+            raise ParseError("mlbb", "resource %d: unsafe name" % index)
+        resources.append({"index": index, "name": name, "size": size, "offset": offset})
+    total = sum(item["size"] for item in resources)
+    if pos + total > len(data):
+        raise ParseError("mlbb", "payload exceeds file")
+    for item in resources:
+        if item["offset"] + item["size"] > total:
+            raise ParseError("mlbb", "resource %s: payload offset out of bounds" % item["name"])
+    return pos, resources
+
+
+def mlbb_build(resources: Sequence[Mapping[str, Any]], payload: bytes) -> bytes:
+    """Rebuild a container from a resource table and concatenated payload."""
+    out = bytearray(MLBB_MAGIC)
+    out += struct.pack("<I", len(resources))
+    for item in resources:
+        name = str(item["name"]).encode("utf-8")
+        out += struct.pack("<I", len(name))
+        out += name
+        out += struct.pack("<I", int(item["size"]))
+        out += struct.pack("<I", int(item["offset"]))
+    return bytes(out) + payload
+
+
+def mlbb_resource(data: bytes, base: int, item: Mapping[str, Any]) -> bytes:
+    start = base + int(item["offset"])
+    end = start + int(item["size"])
+    if start < base or end > len(data):
+        raise ParseError("mlbb", "resource %s out of bounds" % item["name"])
+    return data[start:end]
+
+
+def mlbb_is_xml(blob: bytes) -> bool:
+    stripped = blob.lstrip()
+    return (stripped.startswith(b"<?xml") or stripped.startswith(b"<root")
+            or (stripped.startswith(b"<") and b">" in stripped[:256]))
+
+
+def mlbb_decode_blob(blob: bytes) -> bytes:
+    """Peel base64/gzip/zlib layers until XML or a stable byte string is reached."""
+    current = blob
+    seen: set = set()
+    for _ in range(MLBB_DECODE_LIMIT):
+        if current in seen:
+            break
+        seen.add(current)
+        if mlbb_is_xml(current):
+            return current
+        compact = current.strip()
+        try:
+            joined = b"".join(compact.split())
+            if len(joined) >= 8 and len(joined) % 4 == 0:
+                decoded = base64.b64decode(joined, validate=True)
+                if decoded and decoded != current:
+                    current = decoded
+                    continue
+        except Exception:
+            pass
+        for decompress in (gzip.decompress, zlib.decompress):
+            try:
+                decoded = decompress(current)
+                if decoded != current:
+                    current = decoded
+                    break
+            except Exception:
+                pass
+        else:
+            break
+    return current
+
+
+def mlbb_encode_blob(original: bytes, modified: bytes, smart: bool = True) -> bytes:
+    """Reapply the original transformation to modified bytes (smart encode)."""
+    if not smart:
+        return modified
+    decoded = mlbb_decode_blob(original)
+    if decoded == original:
+        return modified
+    compact = original.strip()
+    try:
+        joined = b"".join(compact.split())
+        if len(joined) >= 8 and len(joined) % 4 == 0 and base64.b64decode(joined, validate=True) == decoded:
+            return base64.b64encode(modified)
+    except Exception:
+        pass
+    try:
+        if gzip.decompress(original) == decoded:
+            return gzip.compress(modified)
+    except Exception:
+        pass
+    try:
+        if zlib.decompress(original) == decoded:
+            return zlib.compress(modified)
+    except Exception:
+        pass
+    return modified
+
+
+def mlbb_output_guard(path: Union[str, Path], force: bool, dry_run: bool) -> Path:
+    target = Path(path)
+    if not dry_run and target.exists() and not force:
+        raise ToolIOError("mlbb", "output exists: %s (use --force)" % target)
+    return target
+
+
+def mlbb_inspect(container: Union[str, Path]) -> Dict[str, Any]:
+    path = require_file(container, "mlbb")
+    data = path.read_bytes()
+    base, resources = mlbb_parse(data)
+    preview = []
+    for item in resources:
+        blob = mlbb_resource(data, base, item)
+        decoded = mlbb_decode_blob(blob) if item["name"].lower().endswith(".xml") else b""
+        preview.append({"name": item["name"], "size": item["size"], "offset": item["offset"],
+                        "container": item["name"].encode("utf-8") in blob and mlbb_is_xml(blob),
+                        "decoded_xml": mlbb_is_xml(decoded),
+                        "decoded_size": len(decoded) if decoded else None})
+    return {"path": str(path), "size": len(data), "header_size": base,
+            "payload_size": len(data) - base, "resource_count": len(resources),
+            "resources": preview}
+
+
+def mlbb_unpack(container: Union[str, Path], dest: Union[str, Path],
+                all_xml: bool = False, dry_run: bool = False) -> Dict[str, Any]:
+    path = require_file(container, "mlbb")
+    data = path.read_bytes()
+    base, resources = mlbb_parse(data)
+    target_dir = Path(dest)
+    wanted = set(MLBB_WANTED_XML)
+    selected = [item for item in resources
+                if item["name"].lower().endswith(".xml")
+                and (all_xml or item["name"] in wanted or Path(item["name"]).name in wanted)]
+    written: List[str] = []
+    skipped: List[Dict[str, str]] = []
+    for item in selected:
+        try:
+            result = mlbb_decode_blob(mlbb_resource(data, base, item))
+            name = Path(item["name"]).name
+            if not dry_run:
+                atomic_write(target_dir / name, result)
+            written.append(name)
+        except (ParseError, OSError, ValueError) as exc:
+            skipped.append({"name": item["name"], "reason": str(exc)})
+    return {"path": str(path), "resource_count": len(resources), "selected": len(selected),
+            "decoded": written, "skipped": skipped, "dry_run": dry_run,
+            "dest": str(target_dir)}
+
+
+def mlbb_repack(container: Union[str, Path], source_dir: Union[str, Path],
+                output: Union[str, Path], smart: bool = True, zip_name: Optional[str] = None,
+                dry_run: bool = False, force: bool = False, cleanup: bool = False) -> Dict[str, Any]:
+    """Rebuild a container from decoded XML files, preserving unmodified resources."""
+    path = require_file(container, "mlbb")
+    original = path.read_bytes()
+    base, resources = mlbb_parse(original)
+    folder = require_dir(source_dir, "mlbb")
+    xml_files = sorted(item for item in folder.rglob("*")
+                       if item.is_file() and item.suffix.lower() == ".xml")
+    if not xml_files:
+        raise UsageError("mlbb", "no XML files found in %s" % folder)
+    replacements: Dict[str, bytes] = {}
+    repacked: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, str]] = []
+    for xml_file in xml_files:
+        try:
+            raw = xml_file.read_bytes()
+            ET.fromstring(raw)
+            resource = next((item for item in resources
+                             if item["name"] == xml_file.name
+                             or Path(item["name"]).name == xml_file.name), None)
+            if resource is None:
+                raise ParseError("mlbb", "resource not found")
+            old = mlbb_resource(original, base, resource)
+            new = mlbb_encode_blob(old, raw, smart)
+            replacements[resource["name"]] = new
+            repacked.append({"name": xml_file.name, "before": len(raw), "after": len(new)})
+        except (ParseError, ET.ParseError, OSError, ValueError) as exc:
+            skipped.append({"name": xml_file.name, "reason": str(exc)})
+    if not replacements:
+        raise ParseError("mlbb", "no valid XML replacements were produced")
+    parts: List[bytes] = []
+    rebuilt_table: List[Dict[str, Any]] = []
+    offset = 0
+    for item in resources:
+        blob = replacements.get(item["name"], mlbb_resource(original, base, item))
+        entry = dict(item)
+        entry["size"] = len(blob)
+        entry["offset"] = offset
+        rebuilt_table.append(entry)
+        parts.append(blob)
+        offset += len(blob)
+    rebuilt = mlbb_build(rebuilt_table, b"".join(parts))
+    target = mlbb_output_guard(output, force, dry_run)
+    zip_path = None
+    cleaned: List[str] = []
+    if not dry_run:
+        atomic_write(target, rebuilt)
+        if zip_name:
+            zip_path = mlbb_make_zip(target, zip_name, force=force)
+        if cleanup:
+            for xml_file in xml_files:
+                try:
+                    xml_file.unlink()
+                    cleaned.append(xml_file.name)
+                except OSError as exc:
+                    skipped.append({"name": xml_file.name, "reason": "cleanup failed: %s" % exc})
+    return {"input": str(path), "output": str(target), "mode": "smart" if smart else "raw",
+            "repacked": repacked, "skipped": skipped, "resource_count": len(resources),
+            "input_size": len(original), "output_size": len(rebuilt),
+            "delta": len(rebuilt) - len(original), "zip": str(zip_path) if zip_path else None,
+            "cleaned": cleaned, "dry_run": dry_run}
+
+
+def mlbb_lossless(container: Union[str, Path], output: Union[str, Path],
+                  dry_run: bool = False, force: bool = False) -> Dict[str, Any]:
+    path = require_file(container, "mlbb")
+    data = path.read_bytes()
+    base, resources = mlbb_parse(data)
+    rebuilt = mlbb_build(resources, data[base:])
+    identical = rebuilt == data
+    first_diff: Optional[int] = None
+    if not identical:
+        first_diff = next((index for index, pair in enumerate(zip(data, rebuilt))
+                           if pair[0] != pair[1]), min(len(data), len(rebuilt)))
+    target = mlbb_output_guard(output, force, dry_run)
+    if not dry_run:
+        atomic_write(target, rebuilt)
+    return {"input": str(path), "output": str(target), "identical": identical,
+            "first_diff": first_diff, "input_size": len(data), "output_size": len(rebuilt),
+            "resource_count": len(resources), "dry_run": dry_run}
+
+
+def mlbb_make_zip(bundle: Union[str, Path], name: str,
+                  dry_run: bool = False, force: bool = False) -> Path:
+    source = require_file(bundle, "mlbb")
+    filename = Path(str(name)).name
+    if not filename.lower().endswith(".zip"):
+        filename += ".zip"
+    target = mlbb_output_guard(Path(source).parent / filename, force, dry_run)
+    if dry_run:
+        return target
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(MLBB_ZIP_ROOT + "/Document.unity3d.res_check_fix/", b"")
+        archive.writestr(MLBB_ZIP_ROOT + "/Document.unity3d.res_check_fix.temp/", b"")
+        archive.write(source, MLBB_ZIP_ROOT + "/Document.unity3d")
+    return target
+
+
+def _mlbb_report(title: str, report: Mapping[str, Any]) -> None:
+    _console("=== %s ===" % title)
+    for key, value in report.items():
+        if isinstance(value, list):
+            _console("%s=%d" % (key, len(value)))
+            for item in value[:50]:
+                _console("  %s" % item)
+        else:
+            _console("%s=%s" % (key, value))
+
+
+def cmd_mlbb(args: argparse.Namespace) -> int:
+    action = getattr(args, "mlbb_cmd", None)
+    if not action:
+        raise UsageError("mlbb", "choose inspect|unpack|repack|encode|lossless|zip")
+    container = getattr(args, "input", None) or str(MLBB_DEFAULT_IN / MLBB_DEFAULT_CONTAINER)
+    if action == "inspect":
+        report = mlbb_inspect(container)
+    elif action == "unpack":
+        report = mlbb_unpack(container, args.dest, args.all, args.dry_run)
+    elif action in ("repack", "encode"):
+        output = getattr(args, "output", None) or str(MLBB_DEFAULT_IN / MLBB_DEFAULT_OUTPUT)
+        report = mlbb_repack(container, args.source_dir, output, smart=(action == "repack"),
+                             zip_name=getattr(args, "zip_name", None),
+                             dry_run=args.dry_run, force=args.force,
+                             cleanup=getattr(args, "cleanup", False))
+    elif action == "lossless":
+        output = getattr(args, "output", None) or str(MLBB_DEFAULT_IN / MLBB_DEFAULT_LOSSLESS)
+        report = mlbb_lossless(container, output, args.dry_run, args.force)
+    elif action == "zip":
+        bundle = getattr(args, "bundle", None) or str(MLBB_DEFAULT_IN / MLBB_DEFAULT_OUTPUT)
+        report = {"zip": str(mlbb_make_zip(bundle, args.name or "Document",
+                                           args.dry_run, args.force))}
+    else:
+        raise UsageError("mlbb", "unknown action: %s" % action)
+    if JSON_MODE:
+        emit_json(report)
+    else:
+        _mlbb_report("MLBB " + action.upper(), report)
+    return EXIT_OK
+
+
+# 27 XML debugging
+def hex_dump_lines(data: bytes, limit: int = 4096, width: int = 16) -> List[str]:
+    lines: List[str] = []
+    for offset in range(0, len(data), width):
+        chunk = data[offset:offset + width]
+        hex_part = " ".join("%02X" % byte for byte in chunk)
+        ascii_part = "".join(chr(byte) if 32 <= byte <= 126 else "." for byte in chunk)
+        lines.append("%08X  %-*s  %s" % (offset, width * 3 - 1, hex_part, ascii_part))
+    return lines
+
+
+def hex_dump_file(path: Union[str, Path], limit: int = 4096, width: int = 16) -> Dict[str, Any]:
+    source = require_file(path, "hexdump")
+    size = source.stat().st_size
+    amount = size if limit == 0 else min(limit, size)
+    with source.open("rb") as handle:
+        data = handle.read(amount)
+    return {"path": str(source), "size": size, "shown": len(data),
+            "truncated": limit != 0 and size > len(data),
+            "lines": hex_dump_lines(data, width=width)}
+
+
+def normalize_code(text: str) -> str:
+    return re.sub(r"\s+", "", text).strip()
+
+
+def valid_xml_files(directory: Union[str, Path]) -> Tuple[List[Tuple[Path, bytes]], List[Dict[str, str]]]:
+    root = require_dir(directory, "xml_debug")
+    valid: List[Tuple[Path, bytes]] = []
+    skipped: List[Dict[str, str]] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() != ".xml":
+            continue
+        try:
+            raw = path.read_bytes()
+            ET.fromstring(raw)
+            valid.append((path, raw))
+        except (ET.ParseError, OSError, UnicodeError, ValueError) as exc:
+            skipped.append({"path": str(path), "reason": str(exc)})
+    return valid, skipped
+
+
+def xml_search(directory: Union[str, Path], query: str, max_lines: int = 20) -> Dict[str, Any]:
+    if not query.strip():
+        raise UsageError("xmlsearch", "search query cannot be empty")
+    valid, skipped = valid_xml_files(directory)
+    needle = normalize_code(query)
+    matches: List[Dict[str, Any]] = []
+    for path, raw in valid:
+        text = raw.decode("utf-8", errors="replace")
+        if needle not in normalize_code(text):
+            continue
+        found = [(number, line.strip()) for number, line in enumerate(text.splitlines(), 1)
+                 if needle in normalize_code(line)]
+        matches.append({"path": str(path), "line_count": len(found),
+                        "lines": [{"number": number, "text": line[:240]}
+                                  for number, line in found[:max_lines]]})
+    return {"directory": str(directory), "scanned": len(valid), "skipped": skipped,
+            "match_count": len(matches), "matches": matches}
+
+
+def xml_modify(directory: Union[str, Path], old: str, new: str,
+               apply: bool = False, max_files: int = 1000) -> Dict[str, Any]:
+    if not old:
+        raise UsageError("xmlmodify", "existing code cannot be empty")
+    valid, skipped = valid_xml_files(directory)
+    changes: List[Dict[str, Any]] = []
+    failures: List[Dict[str, str]] = []
+    for path, raw in valid:
+        text = raw.decode("utf-8", errors="replace")
+        count = text.count(old)
+        if not count:
+            continue
+        updated = text.replace(old, new)
+        try:
+            ET.fromstring(updated)
+        except (ET.ParseError, ValueError) as exc:
+            failures.append({"path": str(path), "reason": "invalid replacement XML: %s" % exc})
+            continue
+        changes.append({"path": str(path), "count": count, "before": len(raw),
+                        "after": len(updated.encode("utf-8")), "text": updated})
+        if len(changes) >= max_files:
+            break
+    changed = 0
+    for item in changes:
+        if apply:
+            try:
+                atomic_write(item["path"], item["text"].encode("utf-8"))
+                changed += 1
+            except OSError as exc:
+                failures.append({"path": item["path"], "reason": "write failed: %s" % exc})
+    return {"directory": str(directory), "scanned": len(valid), "skipped": skipped,
+            "found_files": len(changes), "occurrences": sum(item["count"] for item in changes),
+            "applied": apply, "changed_files": changed, "failures": failures,
+            "files": [{"path": item["path"], "count": item["count"],
+                       "before": item["before"], "after": item["after"]} for item in changes]}
+
+
+def search_files(root: Union[str, Path], name_pattern: Optional[str] = None,
+                 text: Optional[str] = None, use_regex: bool = False,
+                 max_results: int = 500) -> Dict[str, Any]:
+    if not name_pattern and not text:
+        raise UsageError("searchfile", "provide --name or --text")
+    base = require_dir(root, "searchfile")
+    pattern = re.compile(text, re.IGNORECASE) if use_regex and text else None
+    needle = text.lower() if text and not use_regex else None
+    matches: List[Dict[str, Any]] = []
+    scanned = 0
+    for path in sorted(base.rglob("*")):
+        if not path.is_file():
+            continue
+        scanned += 1
+        if name_pattern and not fnmatch.fnmatch(path.name, name_pattern):
+            continue
+        if text:
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                continue
+            if b"\x00" in raw[:4096]:
+                continue
+            content = raw.decode("utf-8", errors="replace")
+            if pattern:
+                found = [(number, line.strip()) for number, line in enumerate(content.splitlines(), 1)
+                         if pattern.search(line)]
+            else:
+                found = [(number, line.strip()) for number, line in enumerate(content.splitlines(), 1)
+                         if needle in line.lower()]
+            if not found:
+                continue
+            matches.append({"path": str(path), "line_count": len(found),
+                            "lines": [{"number": number, "text": line[:240]}
+                                      for number, line in found[:20]]})
+        else:
+            matches.append({"path": str(path), "size": path.stat().st_size})
+        if len(matches) >= max_results:
+            break
+    return {"root": str(base), "scanned": scanned, "name_pattern": name_pattern,
+            "text": text, "regex": use_regex, "truncated": len(matches) >= max_results,
+            "match_count": len(matches), "matches": matches}
+
+
+def _debug_report(title: str, report: Mapping[str, Any]) -> None:
+    _console("=== %s ===" % title)
+    for key, value in report.items():
+        if key in ("lines", "matches", "runs", "samples", "regions", "hits", "skipped",
+                   "failures", "files") and isinstance(value, list):
+            _console("%s=%d" % (key, len(value)))
+            for item in value[:40]:
+                _console("  %s" % item)
+        elif isinstance(value, list):
+            _console("%s=%d" % (key, len(value)))
+        else:
+            _console("%s=%s" % (key, value))
+
+
+def cmd_hexdump(args: argparse.Namespace) -> int:
+    report = hex_dump_file(args.path, args.limit)
+    if JSON_MODE:
+        emit_json(report)
+    else:
+        _console("=== HEX READER ===")
+        _console("path=%s size=%d shown=%d truncated=%s" %
+                 (report["path"], report["size"], report["shown"], report["truncated"]))
+        for line in report["lines"][:args.limit or 65536]:
+            _console(line)
+    return EXIT_OK
+
+
+def cmd_xmlsearch(args: argparse.Namespace) -> int:
+    report = xml_search(args.directory, args.query, args.max_lines)
+    if JSON_MODE:
+        emit_json(report)
+    else:
+        _debug_report("XML SEARCH", report)
+    return EXIT_OK
+
+
+def cmd_xmlmodify(args: argparse.Namespace) -> int:
+    report = xml_modify(args.directory, args.old, args.new, args.apply)
+    if JSON_MODE:
+        emit_json(report)
+    else:
+        _debug_report("XML MODIFY", report)
+    return EXIT_OK
+
+
+def cmd_searchfile(args: argparse.Namespace) -> int:
+    report = search_files(args.root, args.name, args.text, args.regex, args.max)
+    if JSON_MODE:
+        emit_json(report)
+    else:
+        _debug_report("FILE SEARCH", report)
+    return EXIT_OK
+
+
+# 28 binary debugging tools
+def binary_diff(first: Union[str, Path], second: Union[str, Path],
+                context: int = 16, max_rows: int = 1000) -> Dict[str, Any]:
+    left_path = require_file(first, "bindiff")
+    right_path = require_file(second, "bindiff")
+    left = left_path.read_bytes()
+    right = right_path.read_bytes()
+    size = min(len(left), len(right))
+    runs: List[Dict[str, Any]] = []
+    index = 0
+    while index < size and len(runs) < max_rows:
+        if left[index] == right[index]:
+            index += 1
+            continue
+        start = index
+        last = index
+        cursor = index + 1
+        while cursor < size and len(runs) < max_rows:
+            if left[cursor] != right[cursor]:
+                last = cursor
+                cursor += 1
+                continue
+            probe = cursor
+            while probe < size and probe - cursor <= 4 and left[probe] == right[probe]:
+                probe += 1
+            if probe < size and left[probe] != right[probe]:
+                last = probe
+                cursor = probe + 1
+                continue
+            break
+        end = last + 1
+        runs.append({"offset": start, "length": end - start,
+                     "a_hex": left[start:end].hex(), "b_hex": right[start:end].hex(),
+                     "a_context": (left[max(0, start - context):start]
+                                   + left[end:end + context]).hex()})
+        index = max(cursor, end)
+    tail = None
+    if len(left) != len(right):
+        longer = left if len(left) > len(right) else right
+        tail = {"offset": size, "length": abs(len(left) - len(right)),
+                "source": "a" if len(left) > len(right) else "b",
+                "hex": longer[size:size + 256].hex()}
+    return {"a": str(left_path), "b": str(right_path), "a_size": len(left),
+            "b_size": len(right), "diff_runs": len(runs), "truncated": len(runs) >= max_rows,
+            "runs": runs, "tail": tail}
+
+
+def entropy_scan(path: Union[str, Path], window: int = 256, step: int = 128,
+                 max_samples: int = 2000) -> Dict[str, Any]:
+    source = require_file(path, "entropy")
+    data = source.read_bytes()
+    window = max(8, min(window, max(8, len(data))))
+    step = max(1, step)
+    samples: List[Dict[str, Any]] = []
+    for offset in range(0, max(1, len(data) - window + 1), step):
+        chunk = data[offset:offset + window]
+        if not chunk:
+            break
+        counts = [0] * 256
+        for byte in chunk:
+            counts[byte] += 1
+        length = float(len(chunk))
+        value = -sum((count / length) * math.log2(count / length) for count in counts if count)
+        samples.append({"offset": offset, "entropy": round(value, 3)})
+        if len(samples) >= max_samples:
+            break
+    high: List[Dict[str, Any]] = []
+    run_start: Optional[int] = None
+    for sample in samples:
+        if sample["entropy"] >= 7.5 and run_start is None:
+            run_start = sample["offset"]
+        elif sample["entropy"] < 7.5 and run_start is not None:
+            high.append({"start": run_start, "end": sample["offset"]})
+            run_start = None
+    if run_start is not None and samples:
+        high.append({"start": run_start, "end": samples[-1]["offset"] + window})
+    values = [sample["entropy"] for sample in samples] or [0.0]
+    return {"path": str(source), "size": len(data), "window": window, "step": step,
+            "samples": samples, "high_entropy_regions": high,
+            "min": min(values), "max": max(values),
+            "mean": round(sum(values) / len(values), 3)}
+
+
+CARVE_SIGNATURES = (("png", b"\x89PNG\r\n\x1a\n"), ("jpeg", b"\xff\xd8\xff"),
+                    ("zip", b"PK\x03\x04"), ("gzip", b"\x1f\x8b\x08"),
+                    ("elf", b"\x7fELF"), ("xml", b"<?xml"))
+
+
+def carve_signatures(path: Union[str, Path], dest: Optional[Union[str, Path]] = None,
+                     max_hits: int = 500) -> Dict[str, Any]:
+    source = require_file(path, "carve")
+    data = source.read_bytes()
+    hits: List[Dict[str, Any]] = []
+    for kind, signature in CARVE_SIGNATURES:
+        cursor = 0
+        while True:
+            found = data.find(signature, cursor)
+            if found < 0:
+                break
+            hits.append({"kind": kind, "offset": found, "signature": signature.hex()})
+            cursor = found + len(signature)
+            if len(hits) >= max_hits:
+                break
+        if len(hits) >= max_hits:
+            break
+    hits.sort(key=lambda item: item["offset"])
+    extracted: List[str] = []
+    if dest:
+        target_dir = Path(dest)
+        for index, hit in enumerate(hits):
+            end = hits[index + 1]["offset"] if index + 1 < len(hits) else len(data)
+            blob = data[hit["offset"]:min(end, hit["offset"] + 16 * 1024 * 1024)]
+            name = "%06d_%s_%08X.bin" % (index, hit["kind"], hit["offset"])
+            atomic_write(target_dir / name, blob)
+            extracted.append(name)
+    return {"path": str(source), "size": len(data), "hits": len(hits),
+            "truncated": len(hits) >= max_hits, "signatures": hits,
+            "extracted": extracted}
+
+
+def xml_lint(directory: Union[str, Path]) -> Dict[str, Any]:
+    valid, skipped = valid_xml_files(directory)
+    issues: List[Dict[str, str]] = []
+    for path, raw in valid:
+        if raw.startswith(b"\xef\xbb\xbf"):
+            issues.append({"path": str(path), "issue": "UTF-8 BOM present"})
+        text = raw.decode("utf-8", errors="replace")
+        if not text.strip():
+            issues.append({"path": str(path), "issue": "empty file"})
+        if "\r\n" in text:
+            issues.append({"path": str(path), "issue": "CRLF line endings"})
+        if re.search(r"&[A-Za-z_][\w.-]*;", text):
+            issues.append({"path": str(path), "issue": "entity reference may need a DTD"})
+    return {"directory": str(directory), "valid": len(valid), "invalid": skipped,
+            "issues": issues, "issue_count": len(issues)}
+
+
+def cmd_debug(args: argparse.Namespace) -> int:
+    action = getattr(args, "debug_cmd", None)
+    if action == "bindiff":
+        report = binary_diff(args.a, args.b, args.context)
+        patch = getattr(args, "patch", None)
+        if patch and not args.dry_run:
+            write_json(patch, {"a": report["a"], "b": report["b"],
+                               "runs": report["runs"], "tail": report["tail"]})
+    elif action == "entropy":
+        report = entropy_scan(args.path, args.window, args.step)
+    elif action == "carve":
+        report = carve_signatures(args.path, getattr(args, "dest", None))
+    elif action == "xmlcheck":
+        report = xml_lint(args.directory)
+    else:
+        raise UsageError("debug", "choose bindiff|entropy|carve|xmlcheck")
+    if JSON_MODE:
+        emit_json(report)
+    else:
+        _debug_report("DEBUG " + action.upper(), report)
+    return EXIT_OK
 
 # 70 selftest
 def _selftest_elf() -> bytes:
@@ -6506,20 +5994,79 @@ def run_selftest() -> int:
 
         check("surface_map", check_surface_map)
 
-        def check_menu() -> None:
-            out = tmp_root / "modmenu"
-            written = emit_mod_menu(out, "com.shitsuke.selftest")
-            assert len(written) > 20
-            activity = out / "app/src/main/java/com/shitsuke/selftest/MainActivity.java"
-            assert activity.is_file()
-            text = activity.read_text(encoding="utf-8")
-            assert "System.loadLibrary(\"menu\")" in text
-            assert "nativeMenuSetFeature" in text and "nativeMenuSetSeek" in text
-            assert (out / "manifest.json").is_file()
-            manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
-            assert any(entry["path"] == "app/src/main/jni/Main.cpp" for entry in manifest)
+        def check_mlbb() -> None:
+            entries: List[Dict[str, Any]] = []
+            payloads: List[bytes] = []
+            offset = 0
+            for name, text in (("BattleSystemConfig.xml", b"<root><a>1</a></root>"),
+                               ("SystemConfig.xml", b"<root><b>2</b></root>")):
+                encoded = base64.b64encode(text)
+                payloads.append(encoded)
+                entries.append({"name": name, "size": len(encoded), "offset": offset})
+                offset += len(encoded)
+            blob = mlbb_build(entries, b"".join(payloads))
+            container = tmp_root / "Documents.unity3d"
+            atomic_write(container, blob)
+            base, parsed = mlbb_parse(blob)
+            assert base > 8 and len(parsed) == 2
+            assert mlbb_decode_blob(mlbb_resource(blob, base, parsed[0])) == b"<root><a>1</a></root>"
+            decode_dir = tmp_root / "mlbb_decode"
+            unpacked = mlbb_unpack(container, decode_dir)
+            assert len(unpacked["decoded"]) == 2
+            assert (decode_dir / "SystemConfig.xml").is_file()
+            atomic_write(decode_dir / "SystemConfig.xml", b"<root><b>3</b></root>")
+            output = tmp_root / "Document.unity3d"
+            repacked = mlbb_repack(container, decode_dir, output, smart=True, force=True)
+            assert repacked["output_size"] > 0 and output.is_file()
+            rebuilt = output.read_bytes()
+            rbase, rparsed = mlbb_parse(rebuilt)
+            assert mlbb_decode_blob(mlbb_resource(rebuilt, rbase, rparsed[1])) == b"<root><b>3</b></root>"
+            lossless = tmp_root / "Document_lossless.unity3d"
+            result = mlbb_lossless(container, lossless, force=True)
+            assert result["identical"] and lossless.read_bytes() == blob
+            zip_path = mlbb_make_zip(output, "patched", force=True)
+            assert zipfile.is_zipfile(zip_path)
+            with zipfile.ZipFile(zip_path) as archive:
+                assert any(name.endswith("Document.unity3d") for name in archive.namelist())
 
-        check("menu", check_menu)
+        check("mlbb_repack", check_mlbb)
+
+        def check_debug_tools() -> None:
+            hex_file = tmp_root / "hex.bin"
+            atomic_write(hex_file, bytes(range(32)))
+            dump = hex_dump_file(hex_file, 16)
+            assert len(dump["lines"]) == 1 and dump["lines"][0].startswith("00000000")
+
+            xml_dir = tmp_root / "xml_debug"
+            xml_dir.mkdir(exist_ok=True)
+            atomic_write(xml_dir / "good.xml", b"<root>\n  <v>1</v>\n</root>")
+            atomic_write(xml_dir / "bad.xml", b"<root><v></root>")
+            valid, skipped = valid_xml_files(xml_dir)
+            assert len(valid) == 1 and len(skipped) == 1
+            found = xml_search(xml_dir, "<root><v>1</v></root>")
+            assert found["match_count"] == 1
+            changed = xml_modify(xml_dir, ">1<", ">2<", apply=True)
+            assert changed["applied"] and changed["changed_files"] == 1
+            assert b"<v>2</v>" in (xml_dir / "good.xml").read_bytes()
+            lint = xml_lint(xml_dir)
+            assert lint["valid"] == 1 and lint["invalid"]
+            files = search_files(xml_dir, name_pattern="*.xml", text="v")
+            assert files["match_count"] >= 1
+
+            left = tmp_root / "diff_a.bin"
+            right = tmp_root / "diff_b.bin"
+            atomic_write(left, b"AAAA\x01BBBB")
+            atomic_write(right, b"AAAA\x02BBBB")
+            diff = binary_diff(left, right)
+            assert diff["diff_runs"] == 1 and diff["runs"][0]["offset"] == 4
+            entropy = entropy_scan(left, window=8, step=4)
+            assert entropy["samples"] and 0 <= entropy["max"] <= 8
+            blob = tmp_root / "carve.bin"
+            atomic_write(blob, b"junk" + gzip.compress(b"hi") + b"PK\x03\x04rest")
+            carved = carve_signatures(blob)
+            assert carved["hits"] >= 2
+
+        check("debug_tools", check_debug_tools)
 
         def check_tui_model() -> None:
             assert "main" in TUI_PAGES and TUI_PAGES["main"][1]
@@ -6587,26 +6134,9 @@ _TUI_GREEN = "\x1b[32m"
 _TUI_YELLOW = "\x1b[33m"
 _TUI_RED = "\x1b[31m"
 
-_TUI_4X5 = {
-    "S": ("1111", "1000", "1111", "0001", "1111"),
-    "H": ("1001", "1001", "1111", "1001", "1001"),
-    "I": ("1111", "0100", "0100", "0100", "1111"),
-    "T": ("1111", "0100", "0100", "0100", "0100"),
-    "U": ("1001", "1001", "1001", "1001", "1111"),
-    "K": ("1001", "1010", "1100", "1010", "1001"),
-    "E": ("1111", "1000", "1110", "1000", "1111"),
-    "Z": ("1111", "0010", "0100", "1000", "1111"),
-}
-
-
 def _tui_block_text(text: str) -> List[str]:
     """Render text with the compact block font used by the interactive header."""
-    rows = [""] * 5
-    for char in text.upper():
-        glyph = _TUI_4X5.get(char, ("0000",) * 5)
-        for index in range(5):
-            rows[index] += glyph[index].replace("1", "█").replace("0", " ") + " "
-    return [row.rstrip() for row in rows]
+    return compact_banner_lines(text)
 
 
 TUI_BANNER_FULL = [line.rstrip() for line in BANNER_ART.strip("\n").splitlines()]
@@ -6618,7 +6148,8 @@ TUI_PAGES: Dict[str, Tuple[str, List[Tuple[str, str, str]]]] = {
         ("Unity & Assets", "UnityFS, asset index, skin swaps, aliases", "unity"),
         ("Data Tools", "XML, JSON, templates, surface maps", "data"),
         ("Device", "ADB actions and Shizuku probe", "device"),
-        ("Mod Menu", "Emit the Android mod-menu scaffold", "modmenu"),
+        ("MLBB Repack", "Unpack, smart encode, lossless test, ZIP", "repack"),
+        ("Debugging", "Hex, search, modify, bindiff, entropy, carve", "debug"),
         ("Utilities", "Banner, selftest, help, about", "utils"),
     ]),
     "binary": ("Recon & Binary", [
@@ -6653,8 +6184,23 @@ TUI_PAGES: Dict[str, Tuple[str, List[Tuple[str, str, str]]]] = {
         ("Wireless ADB", "Pair or connect over Wi-Fi", "act_adb_wireless"),
         ("Shizuku probe", "Environment, paths and Shizuku state", "act_shizuku"),
     ]),
-    "modmenu": ("Mod Menu", [
-        ("Emit scaffold", "Android mod-menu source tree and manifest", "act_menu"),
+    "repack": ("MLBB Repack", [
+        ("Inspect container", "List MLBB resources and payload layout", "act_mlbb_inspect"),
+        ("Unpack XML", "Decode BattleSystemConfig/SystemConfig", "act_mlbb_unpack"),
+        ("Smart repack", "Re-apply base64/gzip/zlib, rebuild, optional ZIP", "act_mlbb_repack"),
+        ("Raw encode", "Rebuild with XML bytes unchanged", "act_mlbb_encode"),
+        ("Lossless test", "Rebuild and verify byte-identical output", "act_mlbb_lossless"),
+        ("Make ZIP", "Wrap Document.unity3d in a flashable ZIP", "act_mlbb_zip"),
+    ]),
+    "debug": ("Debugging", [
+        ("Hex reader", "Read-only offset/hex/ASCII dump", "act_hexdump"),
+        ("Search code", "Whitespace-insensitive search in valid XML", "act_xmlsearch"),
+        ("Modify XML", "Replace exact snippets after validation", "act_xmlmodify"),
+        ("Search file", "Find files by name or text content", "act_searchfile"),
+        ("Binary diff", "Offset-level diff with context and patch JSON", "act_bindiff"),
+        ("Entropy map", "Find packed/encrypted regions", "act_entropy"),
+        ("Carve signatures", "Locate PNG/ZIP/GZIP/ELF/XML inside a blob", "act_carve"),
+        ("XML check", "Validate and lint every XML in a folder", "act_xmlcheck"),
     ]),
     "utils": ("Utilities", [
         ("Banner", "Print the block-letter banner", "act_banner"),
@@ -7647,18 +7193,211 @@ class Tui:
             argv.extend(["--device", value["serial"]])
         self.run_cli(argv, "Shizuku Probe")
 
-    def act_menu(self) -> None:
-        value = self.collect("Mod Menu Scaffold", [
-            {"key": "pkg", "label": "Package root", "default": "com.android.support", "required": True},
-            {"key": "out", "label": "Output directory", "default": "modmenu", "required": True},
+    def _mlbb_container_spec(self) -> Dict[str, Any]:
+        return {"key": "input", "label": "Container (Documents.unity3d)",
+                "default": str(MLBB_DEFAULT_IN / MLBB_DEFAULT_CONTAINER), "required": True}
+
+    def _mlbb_decode_spec(self) -> Dict[str, Any]:
+        return {"key": "dir", "label": "Decoded XML directory",
+                "default": str(MLBB_DEFAULT_OUT), "required": True}
+
+    def act_mlbb_inspect(self) -> None:
+        container = self._input("MLBB Inspect", "Container (Documents.unity3d)",
+                                str(MLBB_DEFAULT_IN / MLBB_DEFAULT_CONTAINER), True)
+        if container is not None:
+            self.run_cli(["mlbb", "inspect", self._p(container)], "MLBB Inspect")
+
+    def act_mlbb_unpack(self) -> None:
+        value = self.collect("Unpack XML", [
+            self._mlbb_container_spec(), self._mlbb_decode_spec(),
+            {"key": "all", "label": "Decode every XML resource?", "bool": True, "default": False},
             {"key": "dry", "label": "Dry run only?", "bool": True, "default": False},
         ])
         if value is None:
             return
-        argv = ["menu", "--pkg", value["pkg"], "--out", self._p(value["out"])]
+        argv = ["mlbb", "unpack", self._p(value["input"]), "--dest", self._p(value["dir"])]
+        if value["all"]:
+            argv.append("--all")
         if value["dry"]:
             argv.append("--dry-run")
-        self.run_cli(argv, "Mod Menu Scaffold")
+        self.run_cli(argv, "Unpack XML")
+
+    def act_mlbb_repack(self) -> None:
+        value = self.collect("Smart Repack", [
+            self._mlbb_container_spec(), self._mlbb_decode_spec(),
+            {"key": "output", "label": "Output container",
+             "default": str(MLBB_DEFAULT_IN / MLBB_DEFAULT_OUTPUT), "required": True},
+            {"key": "zip", "label": "Also make a ZIP (blank = skip)", "required": False,
+             "hint": "Example: Document_patched"},
+            {"key": "cleanup", "label": "Delete decoded XML afterwards?", "bool": True, "default": False},
+            {"key": "force", "label": "Overwrite existing output?", "bool": True, "default": True},
+            {"key": "dry", "label": "Dry run only?", "bool": True, "default": False},
+        ])
+        if value is None:
+            return
+        argv = ["mlbb", "repack", self._p(value["input"]), "--dir", self._p(value["dir"]),
+                "--output", self._p(value["output"])]
+        if value["zip"]:
+            argv.extend(["--zip", value["zip"]])
+        if value["cleanup"]:
+            argv.append("--cleanup")
+        if value["force"]:
+            argv.append("--force")
+        if value["dry"]:
+            argv.append("--dry-run")
+        self.run_cli(argv, "Smart Repack")
+
+    def act_mlbb_encode(self) -> None:
+        value = self.collect("Raw Encode", [
+            self._mlbb_container_spec(), self._mlbb_decode_spec(),
+            {"key": "output", "label": "Output container",
+             "default": str(MLBB_DEFAULT_IN / MLBB_DEFAULT_OUTPUT), "required": True},
+            {"key": "cleanup", "label": "Delete decoded XML afterwards?", "bool": True, "default": False},
+            {"key": "force", "label": "Overwrite existing output?", "bool": True, "default": True},
+            {"key": "dry", "label": "Dry run only?", "bool": True, "default": False},
+        ])
+        if value is None:
+            return
+        argv = ["mlbb", "encode", self._p(value["input"]), "--dir", self._p(value["dir"]),
+                "--output", self._p(value["output"])]
+        if value["cleanup"]:
+            argv.append("--cleanup")
+        if value["force"]:
+            argv.append("--force")
+        if value["dry"]:
+            argv.append("--dry-run")
+        self.run_cli(argv, "Raw Encode")
+
+    def act_mlbb_lossless(self) -> None:
+        value = self.collect("Lossless Test", [
+            self._mlbb_container_spec(),
+            {"key": "output", "label": "Lossless output",
+             "default": str(MLBB_DEFAULT_IN / MLBB_DEFAULT_LOSSLESS), "required": True},
+            {"key": "force", "label": "Overwrite existing output?", "bool": True, "default": True},
+            {"key": "dry", "label": "Dry run only?", "bool": True, "default": False},
+        ])
+        if value is None:
+            return
+        argv = ["mlbb", "lossless", self._p(value["input"]), "--output", self._p(value["output"])]
+        if value["force"]:
+            argv.append("--force")
+        if value["dry"]:
+            argv.append("--dry-run")
+        self.run_cli(argv, "Lossless Test")
+
+    def act_mlbb_zip(self) -> None:
+        value = self.collect("Make ZIP", [
+            {"key": "bundle", "label": "Document.unity3d to package",
+             "default": str(MLBB_DEFAULT_IN / MLBB_DEFAULT_OUTPUT), "required": True},
+            {"key": "name", "label": "ZIP name (without .zip)", "default": "Document", "required": True},
+            {"key": "force", "label": "Overwrite existing ZIP?", "bool": True, "default": True},
+            {"key": "dry", "label": "Dry run only?", "bool": True, "default": False},
+        ])
+        if value is None:
+            return
+        argv = ["mlbb", "zip", self._p(value["bundle"]), "--name", value["name"]]
+        if value["force"]:
+            argv.append("--force")
+        if value["dry"]:
+            argv.append("--dry-run")
+        self.run_cli(argv, "Make ZIP")
+
+    def act_hexdump(self) -> None:
+        value = self.collect("Hex Reader", [
+            {"key": "path", "label": "File to read", "required": True,
+             "default": str(MLBB_DEFAULT_IN / MLBB_DEFAULT_CONTAINER)},
+            {"key": "limit", "label": "Bytes to show (0 = capped all)", "default": "4096", "required": True},
+        ])
+        if value is not None:
+            self.run_cli(["hexdump", self._p(value["path"]), "--limit", value["limit"]], "Hex Reader")
+
+    def act_xmlsearch(self) -> None:
+        value = self.collect("Search Code", [
+            self._mlbb_decode_spec(),
+            {"key": "query", "label": "XML/code snippet to find", "required": True,
+             "hint": "Whitespace is ignored while matching"},
+        ])
+        if value is not None:
+            self.run_cli(["xmlsearch", self._p(value["dir"]), "--query", value["query"]], "Search Code")
+
+    def act_xmlmodify(self) -> None:
+        value = self.collect("Modify XML", [
+            self._mlbb_decode_spec(),
+            {"key": "old", "label": "Exact code to replace", "required": True},
+            {"key": "new", "label": "Replacement code", "required": False},
+            {"key": "apply", "label": "Write the changes?", "bool": True, "default": False},
+        ])
+        if value is None:
+            return
+        argv = ["xmlmodify", self._p(value["dir"]), "--old", value["old"], "--new", value["new"]]
+        if value["apply"]:
+            argv.append("--apply")
+        self.run_cli(argv, "Modify XML")
+
+    def act_searchfile(self) -> None:
+        value = self.collect("Search File", [
+            {"key": "root", "label": "Directory to search", "default": ".", "required": True},
+            {"key": "name", "label": "Filename glob (blank = any)", "required": False,
+             "hint": "Example: *.xml"},
+            {"key": "text", "label": "Text to find (blank = name only)", "required": False},
+            {"key": "regex", "label": "Treat text as a regex?", "bool": True, "default": False},
+        ])
+        if value is None:
+            return
+        if not value["name"] and not value["text"]:
+            self.wait_message("Enter a filename glob or text to search for.", "Search File")
+            return
+        argv = ["searchfile", self._p(value["root"])]
+        if value["name"]:
+            argv.extend(["--name", value["name"]])
+        if value["text"]:
+            argv.extend(["--text", value["text"]])
+        if value["regex"]:
+            argv.append("--regex")
+        self.run_cli(argv, "Search File")
+
+    def act_bindiff(self) -> None:
+        value = self.collect("Binary Diff", [
+            {"key": "a", "label": "Original file", "required": True},
+            {"key": "b", "label": "Modified file", "required": True},
+            {"key": "context", "label": "Context bytes", "default": "16", "required": True},
+            {"key": "patch", "label": "Patch JSON path (blank = skip)", "required": False},
+        ])
+        if value is None:
+            return
+        argv = ["debug", "bindiff", self._p(value["a"]), self._p(value["b"]),
+                "--context", value["context"]]
+        if value["patch"]:
+            argv.extend(["--patch", self._p(value["patch"])])
+        self.run_cli(argv, "Binary Diff")
+
+    def act_entropy(self) -> None:
+        value = self.collect("Entropy Map", [
+            {"key": "path", "label": "File to scan", "required": True},
+            {"key": "window", "label": "Window bytes", "default": "256", "required": True},
+            {"key": "step", "label": "Step bytes", "default": "128", "required": True},
+        ])
+        if value is not None:
+            self.run_cli(["debug", "entropy", self._p(value["path"]),
+                          "--window", value["window"], "--step", value["step"]], "Entropy Map")
+
+    def act_carve(self) -> None:
+        value = self.collect("Carve Signatures", [
+            {"key": "path", "label": "Blob to scan", "required": True},
+            {"key": "dest", "label": "Extract directory (blank = offsets only)", "required": False},
+        ])
+        if value is None:
+            return
+        argv = ["debug", "carve", self._p(value["path"])]
+        if value["dest"]:
+            argv.extend(["--dest", self._p(value["dest"])])
+        self.run_cli(argv, "Carve Signatures")
+
+    def act_xmlcheck(self) -> None:
+        directory = self._input("XML Check", "Directory to validate",
+                                str(MLBB_DEFAULT_OUT), True)
+        if directory is not None:
+            self.run_cli(["debug", "xmlcheck", self._p(directory)], "XML Check")
 
     def act_banner(self) -> None:
         body = (BANNER_ART.strip("\n") + "\n" + BANNER_LINE + "\n\n"
@@ -8377,28 +8116,6 @@ def cmd_shizuku(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def cmd_menu(args: argparse.Namespace) -> int:
-    destination = Path(args.out) if args.out else Path("modmenu")
-    if args.dry_run:
-        with tempfile.TemporaryDirectory(prefix="shitsuke_menu_") as td:
-            written = emit_mod_menu(td, args.pkg)
-        result = {"out": str(destination), "file_count": len(written), "dry_run": True,
-                  "files": [str(path).replace(td, "<plan>") for path in written]}
-        if JSON_MODE:
-            emit_json(result)
-        else:
-            info("menu", "would emit %d file(s) to %s" % (len(written), destination))
-        return EXIT_OK
-    written = emit_mod_menu(destination, args.pkg)
-    result = {"out": str(destination), "file_count": len(written), "dry_run": False,
-              "files": [str(path) for path in written]}
-    if JSON_MODE:
-        emit_json(result)
-    else:
-        info("menu", "emitted %d file(s) to %s" % (len(written), destination))
-    return EXIT_OK
-
-
 def cmd_map(args: argparse.Namespace) -> int:
     if args.exact and args.regex:
         raise UsageError("map", "--exact and --regex are mutually exclusive")
@@ -8453,8 +8170,13 @@ DISPATCH: Dict[str, Callable[[argparse.Namespace], int]] = {
     "gen": cmd_gen,
     "adb": cmd_adb,
     "shizuku": cmd_shizuku,
-    "menu": cmd_menu,
     "map": cmd_map,
+    "mlbb": cmd_mlbb,
+    "debug": cmd_debug,
+    "hexdump": cmd_hexdump,
+    "xmlsearch": cmd_xmlsearch,
+    "xmlmodify": cmd_xmlmodify,
+    "searchfile": cmd_searchfile,
 }
 
 

@@ -1,156 +1,150 @@
 # Shitsuke Toolz
 
-![Python](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)
-![License](https://img.shields.io/badge/license-MIT-green)
-![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Linux-orange?logo=linux)
-![Status](https://img.shields.io/badge/status-beta-yellow)
-![Tests](https://img.shields.io/badge/selftest-passing-brightgreen)
-
 > VIP Toolkit For Devs (beta) — a universal developer toolkit for **Mobile Legends: Bang Bang** (`com.mobile.legends`, Unity/IL2CPP, asset root `dragon2017`).
 
-Built for modders, exploit devs, and reverse engineers. One file. No placeholders. No network. Pure stdlib with optional deps wrapped in fallbacks.
+One Python file. No install, no network, no mandatory packages. Built for reverse engineers and modders who want to inspect files, debug XML, and repack MLBB config bundles.
 
 ---
 
-## Features
+## 1. Install (once)
 
-- **Binary Recon** — ELF parser (32/64-bit), target resolver, `global-metadata.dat` header parser with 8-rung recovery ladder, AOB scanner, strings/symbols extractor.
-- **UnityFS & Assets** — UnityFS header/blocks/nodes, LZMA & LZ4 decompression (pure-Python fallback), SerializedFile parser, asset indexer, mini_patch shadowing detection.
-- **Skin Engine** — skin swap planner with backup manifests + `restore.py`, alias injection, GameResAlternative rewriter, cache integrity checks.
-- **Templates** — GameGuardian Lua, Frida JS, C++ stubs, Python stubs, each validated before write.
-- **Device** — ADB wrapper, Shizuku probe, env/path resolver, wireless ADB helper.
-- **Mod Menu Scaffold** — full LGLTeam-style Android mod menu source tree emitter with manifest.
-- **Surface Map** — keyword-driven CSV/JSON mapping across strings, symbols, metadata, assets.
-- **Interactive UI** — run with no arguments for a full-screen arrow-key menu with clean alternate-screen exit.
-- **Self-Test** — `--selftest` exercises every subsystem against synthetic fixtures.
-
-## Setup Guide
-
-The toolkit is a single Python file with no mandatory third-party packages. Pick the setup for your device; every path below ends with the same self-test.
-
-### Android — Termux (recommended)
-
-1. Install **Termux** from [F-Droid](https://f-droid.org/packages/com.termux/) or the [GitHub releases](https://github.com/termux/termux-app/releases). Do not use the Play Store build — it is outdated.
-2. Open Termux and run:
+**Termux (Android):**
 
 ```bash
-pkg update -y && pkg upgrade -y
-pkg install -y python git
-git clone https://github.com/dottodev/shitsuke_toolz.git
-cd shitsuke_toolz
+pkg update -y && pkg install -y python git
+```
+
+**Linux / macOS / WSL:** install Python 3.9+. **AndCode / UserLAnd:** Python is already there; just use `python3`.
+
+Check it works:
+
+```bash
 python shitsuke_toolz.py --selftest
 ```
 
-Expected result: `selftest: 22 passed, 0 failed` and exit code `0`.
+Expected: `selftest: 23 passed, 0 failed` and exit code `0`.
 
-3. Give Termux access to shared storage, then point the tool at the game files:
+---
 
-```bash
-termux-setup-storage
-FILES=~/storage/shared/Android/data/com.mobile.legends/files
-python shitsuke_toolz.py recon "$FILES"
-python shitsuke_toolz.py assets --root "$FILES" --out ./out
-```
+## 2. Put the tool in Download
 
-4. Optional extras (the tool works without them):
+Copy `shitsuke_toolz.py` into your shared **Download** folder, e.g. `/sdcard/Download` (Termux calls it `~/storage/downloads`). Use any file manager, `cp`, or `adb push`.
 
-```bash
-pkg install -y nodejs    # enables node --check for generated JavaScript
-pip install lz4          # faster LZ4; a pure-Python fallback is built in
-```
+---
 
-**Android 11+ note:** `/sdcard/Android/data` is blocked for most apps, even with storage permission. Pull the files with ADB instead:
+## 3. Run it
 
 ```bash
-pkg install -y android-tools
-adb devices
-adb pull /sdcard/Android/data/com.mobile.legends/files ./mlbb-files
-python shitsuke_toolz.py recon ./mlbb-files
-```
-
-On a rooted device you can copy the directory with `su -c` instead. File analysis needs no root; only live device paths need ADB or root.
-
-### Android — AndCode
-
-Open this repository in **AndCode**, then use its built-in terminal:
-
-```bash
-cd /workspace/NewZ   # or your imported repo folder
-python3 shitsuke_toolz.py --selftest
-```
-
-AndCode already provides the Python runtime, so no `pkg`/`apt` step is needed. Outputs written under the workspace are visible in the app's file browser.
-
-### Android — UserLAnd
-
-1. Install **UserLAnd** and create an Ubuntu session.
-2. Inside Ubuntu:
-
-```bash
-sudo apt update && sudo apt install -y python3 git
-git clone https://github.com/dottodev/shitsuke_toolz.git
-cd shitsuke_toolz
-python3 shitsuke_toolz.py --selftest
-```
-
-Use `adb pull` (from a host or Termux) to copy game files into UserLAnd's home directory; UserLAnd may not see `/sdcard/Android/data` directly.
-
-### Other apps and platforms
-
-- **ZeroTermux / Termux forks** — identical to the Termux steps above.
-- **MT Manager / ZArchiver** — use these to extract APKs/OBBs and browse `dragon2017`; run the toolkit from Termux or AndCode.
-- **Linux / macOS** — `git clone`, then `python3 shitsuke_toolz.py --selftest`. Install `lz4` with your package manager for faster decompression.
-- **Windows** — use WSL and follow the Linux steps, or run `py shitsuke_toolz.py --selftest` in a native Python 3.9+ install.
-- **iSH (iOS)** — install `python3` and `git` with `apk add`, then run the same commands. It works but is slow on large bundles.
-
-### Troubleshooting
-
-| Symptom | Fix |
-| --- | --- |
-| `python: command not found` | Termux: `pkg install python`, then use `python`. Linux/AndCode: use `python3`. |
-| `Permission denied` reading `Android/data` | Android 11+ restriction — use `adb pull`, root, or copy files to `~/storage/shared/Download`. |
-| Self-test fails | Check `python3 --version` is 3.9+, and run the script from the repository root. |
-| `adb not found` | `pkg install android-tools`, or pass `--adb /path/to/adb`. |
-| `node unavailable, syntax check limited` | Optional: `pkg install nodejs`. Templates still validate with the built-in delimiter checks. |
-| LZ4 decompression is slow | Optional: `pip install lz4`; without it the pure-Python fallback is used. |
-| `No module named lz4` / `frida` | Both are optional and handled automatically. |
-
-## Interactive UI
-
-Run the tool with no arguments on a terminal:
-
-```bash
+cd storage/download
 python shitsuke_toolz.py
 ```
 
-Use `Up`/`Down` or `j`/`k` to move, `Enter`/`Right` to open, and `q`/`Esc` to go back. On the main menu `q` quits. Number keys jump straight to an option. The menu uses an alternate terminal screen, so quitting restores your shell exactly as it was — no leftover text.
+On Linux/AndCode use `python3` instead of `python`. The menu opens full-screen. If you do not have a terminal window, run `python shitsuke_toolz.py --help` to see the CLI.
 
-Actions prompt for their inputs inside the UI, then show output in a scrollable pager (`q` or `Enter` returns). The full CLI stays available for scripts. The same screen launches with `python shitsuke_toolz.py tui`.
+**Menu keys:** `↑/↓` or `j/k` move, `Enter` opens, number keys jump, `q`/`Esc` goes back, `q` on the main menu quits. Quitting restores your terminal exactly as it was.
 
-## Quick Start
+---
+
+## 4. Common workflows
+
+### Unpack the config XML
+
+1. Main menu → **MLBB Repack** → **Unpack XML**.
+2. Container: `/storage/emulated/0/mlbb/encode/Documents.unity3d` (already filled in — press Enter).
+3. Decode directory: `/storage/emulated/0/mlbb/decode` (already filled in — press Enter).
+4. The two config files appear in the decode folder: `BattleSystemConfig.xml` and `SystemConfig.xml`.
+
+Choose **Decode every XML resource?** = yes if you need all XML files instead of just those two.
+
+### Edit and smart repack
+
+1. Edit the XML files in `/storage/emulated/0/mlbb/decode` with any text editor.
+2. Main menu → **MLBB Repack** → **Smart repack**.
+3. Press Enter to accept the container, decode folder, and output (`/storage/emulated/0/mlbb/encode/Document.unity3d`).
+4. Enter a ZIP name if you want a flashable package, or leave it blank.
+5. The tool re-applies the original base64/gzip/zlib encoding, rebuilds the container, and writes the output. Answer yes to "Delete decoded XML afterwards?" if you want the decode folder cleaned up.
+
+Use **Raw encode** instead when the original resource was plain XML and you do not want any encoding re-applied.
+
+### Verify a clean round-trip
+
+Main menu → **MLBB Repack** → **Lossless test**. It rebuilds the container without edits and tells you `BYTE-IDENTICAL` or the first differing offset.
+
+### Debug a file
+
+Main menu → **Debugging**:
+
+- **Hex reader** — read-only offset/hex/ASCII dump of any file.
+- **Search code** — find a snippet in well-formed XML; whitespace is ignored and malformed files are skipped.
+- **Modify XML** — replace an exact snippet in all valid XML files; the replacement is validated before anything is written.
+- **Search file** — find files by name glob, by text, or both.
+- **Binary diff** — offset-level diff with context; can write a JSON patch map.
+- **Entropy map** — find compressed or encrypted regions.
+- **Carve signatures** — locate PNG/ZIP/GZIP/ELF/XML signatures inside a blob.
+- **XML check** — validate and lint every XML in a folder before repacking.
+
+Other menus cover ELF/metadata/AOB recon (`Recon & Binary`), UnityFS/assets (`Unity & Assets`), XML/JSON/templates (`Data Tools`), and ADB/Shizuku (`Device`).
+
+---
+
+## Debugging & MLBB repack (what was added)
+
+**MLBB container tools** — parse and rebuild `MLBB` containers, smart encode (preserves base64/gzip/zlib), raw encode, unpack XML, lossless rebuild test, and flashable ZIP output.
+
+**XML debugging** — read-only hex reader, whitespace-insensitive code search, validated exact-snippet modification, and file/name search.
+
+**Four extra developer tools** — binary diff with patch map, Shannon entropy map, signature carver, and batch XML lint/validator.
+
+The mod-menu scaffold was removed; this build focuses on debugging and repacking.
+
+---
+
+## CLI (optional)
+
+Everything in the menu is also a command:
 
 ```bash
-python shitsuke_toolz.py            # interactive TUI
-python shitsuke_toolz.py --selftest
-python shitsuke_toolz.py banner
-python shitsuke_toolz.py elf libil2cpp.so
-python shitsuke_toolz.py metadata global-metadata.dat --recover
-python shitsuke_toolz.py scan file.bin --pattern "48 8B ?? 90"
+python shitsuke_toolz.py mlbb unpack --all
+python shitsuke_toolz.py mlbb repack --zip Document_patched
+python shitsuke_toolz.py mlbb lossless
+python shitsuke_toolz.py hexdump Documents.unity3d --limit 4096
+python shitsuke_toolz.py xmlsearch decode --query '<root><value>1</value></root>'
+python shitsuke_toolz.py xmlmodify decode --old '>1<' --new '>2<' --apply
+python shitsuke_toolz.py searchfile /sdcard/mlbb --name '*.xml' --text cooldown
+python shitsuke_toolz.py debug bindiff original.bin patched.bin --patch patch.json
+python shitsuke_toolz.py debug entropy Document.unity3d
+python shitsuke_toolz.py debug carve blob.bin --dest carved/
+python shitsuke_toolz.py debug xmlcheck decode
 ```
 
-## CLI
+Full command list:
 
 ```text
-shitsuke_toolz.py {banner,tui,recon,elf,metadata,scan,strings,assets,unityfs,skin,alias,resmap,xml,json,gen,adb,shizuku,menu,map,selftest}
+banner tui recon elf metadata scan strings assets unityfs skin alias resmap
+xml json gen adb shizuku map mlbb debug hexdump xmlsearch xmlmodify searchfile selftest
 ```
 
 Global flags: `--verbose --json --out DIR --adb PATH --device SERIAL --no-color --dry-run --force --selftest`
 
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+| --- | --- |
+| `python: command not found` | Termux: `pkg install python`. Linux/AndCode: use `python3`. |
+| Cannot read `Android/data` | Android 11+ blocks it — use `adb pull`, root, or copy files to `~/storage/shared/Download`. |
+| Self-test fails | Use Python 3.9+ and run from the folder containing the script. |
+| `output exists` | Pass `--force`, or answer yes to "Overwrite existing output?" in the menu. |
+| LZ4 is slow | Optional: `pip install lz4`; a pure-Python fallback is built in. |
+
+---
+
 ## Requirements
 
 - Python 3.9+
-- Optional: `lz4`, `frida` (wrapped in try/except with fallbacks)
-- For device features: `adb` in PATH or `--adb PATH`
+- Optional: `lz4`, `frida` (both fall back cleanly)
+- Device features: `adb` in PATH or `--adb PATH`
 
 ## License
 
