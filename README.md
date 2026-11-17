@@ -21,7 +21,98 @@ Built for modders, exploit devs, and reverse engineers. One file. No placeholder
 - **Device** — ADB wrapper, Shizuku probe, env/path resolver, wireless ADB helper.
 - **Mod Menu Scaffold** — full LGLTeam-style Android mod menu source tree emitter with manifest.
 - **Surface Map** — keyword-driven CSV/JSON mapping across strings, symbols, metadata, assets.
-- **Self-Test** — `--selftest` runs every subcommand against synthetic fixtures.
+- **Self-Test** — `--selftest` exercises every subsystem against synthetic fixtures.
+
+## Setup Guide
+
+The toolkit is a single Python file with no mandatory third-party packages. Pick the setup for your device; every path below ends with the same self-test.
+
+### Android — Termux (recommended)
+
+1. Install **Termux** from [F-Droid](https://f-droid.org/packages/com.termux/) or the [GitHub releases](https://github.com/termux/termux-app/releases). Do not use the Play Store build — it is outdated.
+2. Open Termux and run:
+
+```bash
+pkg update -y && pkg upgrade -y
+pkg install -y python git
+git clone https://github.com/dottodev/shitsuke_toolz.git
+cd shitsuke_toolz
+python shitsuke_toolz.py --selftest
+```
+
+Expected result: `selftest: 21 passed, 0 failed` and exit code `0`.
+
+3. Give Termux access to shared storage, then point the tool at the game files:
+
+```bash
+termux-setup-storage
+FILES=~/storage/shared/Android/data/com.mobile.legends/files
+python shitsuke_toolz.py recon "$FILES"
+python shitsuke_toolz.py assets --root "$FILES" --out ./out
+```
+
+4. Optional extras (the tool works without them):
+
+```bash
+pkg install -y nodejs    # enables node --check for generated JavaScript
+pip install lz4          # faster LZ4; a pure-Python fallback is built in
+```
+
+**Android 11+ note:** `/sdcard/Android/data` is blocked for most apps, even with storage permission. Pull the files with ADB instead:
+
+```bash
+pkg install -y android-tools
+adb devices
+adb pull /sdcard/Android/data/com.mobile.legends/files ./mlbb-files
+python shitsuke_toolz.py recon ./mlbb-files
+```
+
+On a rooted device you can copy the directory with `su -c` instead. File analysis needs no root; only live device paths need ADB or root.
+
+### Android — AndCode
+
+Open this repository in **AndCode**, then use its built-in terminal:
+
+```bash
+cd /workspace/NewZ   # or your imported repo folder
+python3 shitsuke_toolz.py --selftest
+```
+
+AndCode already provides the Python runtime, so no `pkg`/`apt` step is needed. Outputs written under the workspace are visible in the app's file browser.
+
+### Android — UserLAnd
+
+1. Install **UserLAnd** and create an Ubuntu session.
+2. Inside Ubuntu:
+
+```bash
+sudo apt update && sudo apt install -y python3 git
+git clone https://github.com/dottodev/shitsuke_toolz.git
+cd shitsuke_toolz
+python3 shitsuke_toolz.py --selftest
+```
+
+Use `adb pull` (from a host or Termux) to copy game files into UserLAnd's home directory; UserLAnd may not see `/sdcard/Android/data` directly.
+
+### Other apps and platforms
+
+- **ZeroTermux / Termux forks** — identical to the Termux steps above.
+- **MT Manager / ZArchiver** — use these to extract APKs/OBBs and browse `dragon2017`; run the toolkit from Termux or AndCode.
+- **Linux / macOS** — `git clone`, then `python3 shitsuke_toolz.py --selftest`. Install `lz4` with your package manager for faster decompression.
+- **Windows** — use WSL and follow the Linux steps, or run `py shitsuke_toolz.py --selftest` in a native Python 3.9+ install.
+- **iSH (iOS)** — install `python3` and `git` with `apk add`, then run the same commands. It works but is slow on large bundles.
+
+### Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| `python: command not found` | Termux: `pkg install python`, then use `python`. Linux/AndCode: use `python3`. |
+| `Permission denied` reading `Android/data` | Android 11+ restriction — use `adb pull`, root, or copy files to `~/storage/shared/Download`. |
+| Self-test fails | Check `python3 --version` is 3.9+, and run the script from the repository root. |
+| `adb not found` | `pkg install android-tools`, or pass `--adb /path/to/adb`. |
+| `node unavailable, syntax check limited` | Optional: `pkg install nodejs`. Templates still validate with the built-in delimiter checks. |
+| LZ4 decompression is slow | Optional: `pip install lz4`; without it the pure-Python fallback is used. |
+| `No module named lz4` / `frida` | Both are optional and handled automatically. |
 
 ## Quick Start
 
