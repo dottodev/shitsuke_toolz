@@ -8,6 +8,7 @@ mod-menu scaffolding. No network access is performed by this tool.
 
 # 00 imports/consts
 import argparse
+import atexit
 import binascii
 import csv
 import hashlib
@@ -16,21 +17,24 @@ import json
 import lzma
 import os
 import re
+import shlex
 import shutil
 import signal
 import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import traceback
 import xml.etree.ElementTree as ET
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from string import Template
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 TOOL_NAME = "shitsuke_toolz"
-TOOL_VERSION = "2.0.0"
+TOOL_VERSION = "2.1.0"
 APP_PKG = "com.mobile.legends"
 ASSET_ROOT = "dragon2017"
 
@@ -374,7 +378,7 @@ def encode_lp_string(text: str, endian: str = "<") -> bytes:
     return bytes(out)
 
 # 06 CLI
-EPILOG = "Global flags must precede the subcommand. Use --help after any subcommand for details."
+EPILOG = "Global flags are accepted before or after the subcommand. Use --help after any subcommand for details."
 
 
 class ToolArgumentParser(argparse.ArgumentParser):
@@ -578,6 +582,10 @@ def make_parser() -> argparse.ArgumentParser:
     sp.add_argument("--exact", action="store_true", help="exact case-insensitive match")
     sp.add_argument("--regex", action="store_true", help="regular-expression match")
     sp.add_argument("--frida-emit", action="store_true", dest="frida_emit", help="write a runtime resolver script")
+
+    _sub(sub, "tui", "launch interactive terminal UI",
+         "Open the full-screen menu. Running the tool with no arguments does the same.",
+         "shitsuke_toolz.py tui", "a TTY")
 
     _sub(sub, "selftest", "run built-in selftest",
          "Run every subsystem against synthetic fixtures.", "shitsuke_toolz.py selftest", "none")
@@ -6513,6 +6521,17 @@ def run_selftest() -> int:
 
         check("menu", check_menu)
 
+        def check_tui_model() -> None:
+            assert "main" in TUI_PAGES and TUI_PAGES["main"][1]
+            for page, (title, items) in TUI_PAGES.items():
+                assert title and items, page
+                for label, _description, target in items:
+                    assert label and target, page
+                    if target not in TUI_PAGES:
+                        assert callable(getattr(Tui, target, None)), "missing action: " + target
+
+        check("tui_model", check_tui_model)
+
         def check_adb() -> None:
             fake = tmp_root / "fakeadb.sh"
             _selftest_fake_adb(fake)
@@ -6557,6 +6576,1137 @@ def run_selftest() -> int:
             print("  failed: %s -> %s" % (name, message))
         return EXIT_SELFTEST
     return EXIT_OK
+# 80 interactive TUI
+
+_TUI_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_TUI_RESET = "\x1b[0m"
+_TUI_BOLD = "\x1b[1m"
+_TUI_DIM = "\x1b[2m"
+_TUI_CYAN = "\x1b[36m"
+_TUI_GREEN = "\x1b[32m"
+_TUI_YELLOW = "\x1b[33m"
+_TUI_RED = "\x1b[31m"
+
+_TUI_4X5 = {
+    "S": ("1111", "1000", "1111", "0001", "1111"),
+    "H": ("1001", "1001", "1111", "1001", "1001"),
+    "I": ("1111", "0100", "0100", "0100", "1111"),
+    "T": ("1111", "0100", "0100", "0100", "0100"),
+    "U": ("1001", "1001", "1001", "1001", "1111"),
+    "K": ("1001", "1010", "1100", "1010", "1001"),
+    "E": ("1111", "1000", "1110", "1000", "1111"),
+    "Z": ("1111", "0010", "0100", "1000", "1111"),
+}
+
+
+def _tui_block_text(text: str) -> List[str]:
+    """Render text with the compact block font used by the interactive header."""
+    rows = [""] * 5
+    for char in text.upper():
+        glyph = _TUI_4X5.get(char, ("0000",) * 5)
+        for index in range(5):
+            rows[index] += glyph[index].replace("1", "█").replace("0", " ") + " "
+    return [row.rstrip() for row in rows]
+
+
+TUI_BANNER_FULL = [line.rstrip() for line in BANNER_ART.strip("\n").splitlines()]
+TUI_BANNER_COMPACT = _tui_block_text("SHITSUKE")
+
+TUI_PAGES: Dict[str, Tuple[str, List[Tuple[str, str, str]]]] = {
+    "main": ("Main Menu", [
+        ("Recon & Binary", "ELF headers, metadata, AOB scans, strings", "binary"),
+        ("Unity & Assets", "UnityFS, asset index, skin swaps, aliases", "unity"),
+        ("Data Tools", "XML, JSON, templates, surface maps", "data"),
+        ("Device", "ADB actions and Shizuku probe", "device"),
+        ("Mod Menu", "Emit the Android mod-menu scaffold", "modmenu"),
+        ("Utilities", "Banner, selftest, help, about", "utils"),
+    ]),
+    "binary": ("Recon & Binary", [
+        ("Target recon", "Resolve libil2cpp/libunity and ABI folders", "act_recon"),
+        ("ELF header", "Sections, segments, symbols and arch", "act_elf"),
+        ("Metadata", "Parse or recover global-metadata.dat", "act_metadata"),
+        ("AOB scan", "Wildcard byte-pattern scan with context", "act_scan"),
+        ("Strings", "Strings and ELF symbols to JSON/CSV", "act_strings"),
+    ]),
+    "unity": ("Unity & Assets", [
+        ("Asset index", "Walk dragon2017/assets and mini_patch", "act_assets"),
+        ("UnityFS", "Inspect blocks, nodes and SerializedFile", "act_unityfs"),
+        ("Skin swap", "Plan or apply a skin swap with restore.py", "act_skin"),
+        ("Alias inject", "Append AssetBundle container aliases", "act_alias"),
+        ("Resmap", "List, edit or restore mulonggame_table_1", "act_resmap"),
+    ]),
+    "data": ("Data Tools", [
+        ("XML tools", "Pretty, diff, merge or validate XML", "act_xml"),
+        ("JSON tools", "Pretty, diff, merge or validate JSON", "act_json"),
+        ("Generate template", "Lua, Frida, C++ and Python templates", "act_gen"),
+        ("Surface map", "Keyword map across strings/symbols/assets", "act_map"),
+    ]),
+    "device": ("Device", [
+        ("ADB devices", "List connected devices", "act_adb_devices"),
+        ("ADB shell", "Run a shell command", "act_adb_shell"),
+        ("ADB push", "Push a file and verify SHA-256", "act_adb_push"),
+        ("ADB pull", "Pull a file and verify SHA-256", "act_adb_pull"),
+        ("ADB logcat", "Filtered logcat capture", "act_adb_logcat"),
+        ("ADB pidof", "Find the game process id", "act_adb_pidof"),
+        ("ADB dumpsys", "Package or window focus dump", "act_adb_dumpsys"),
+        ("ADB bugreport", "Capture a bugreport zip", "act_adb_bugreport"),
+        ("Wireless ADB", "Pair or connect over Wi-Fi", "act_adb_wireless"),
+        ("Shizuku probe", "Environment, paths and Shizuku state", "act_shizuku"),
+    ]),
+    "modmenu": ("Mod Menu", [
+        ("Emit scaffold", "Android mod-menu source tree and manifest", "act_menu"),
+    ]),
+    "utils": ("Utilities", [
+        ("Banner", "Print the block-letter banner", "act_banner"),
+        ("Selftest", "Run all synthetic subsystem checks", "act_selftest"),
+        ("CLI help", "Show the full command reference", "act_help"),
+        ("About", "Version, target and controls", "act_about"),
+    ]),
+}
+
+
+def _tui_visible_len(text: str) -> int:
+    """Return printable width ignoring ANSI escape sequences."""
+    return len(_TUI_ANSI_RE.sub("", text))
+
+
+def _tui_clip(text: str, width: int) -> str:
+    """Clip text to a printable width while preserving ANSI sequences."""
+    if width <= 0:
+        return ""
+    if _tui_visible_len(text) <= width:
+        return text
+    out: List[str] = []
+    visible = 0
+    index = 0
+    while index < len(text) and visible < width:
+        match = _TUI_ANSI_RE.match(text, index)
+        if match:
+            out.append(match.group())
+            index = match.end()
+            continue
+        out.append(text[index])
+        visible += 1
+        index += 1
+    out.append(_TUI_RESET)
+    return "".join(out)
+
+
+def _tui_plain_clip(text: str, width: int) -> str:
+    """Clip plain text, adding an ellipsis when a line is shortened."""
+    text = _TUI_ANSI_RE.sub("", text)
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width == 1:
+        return text[:1]
+    return text[: width - 1] + "…"
+
+
+def _tui_wrap(text: str, width: int) -> List[str]:
+    """Wrap text to a printable width while preserving blank lines."""
+    width = max(1, width)
+    lines: List[str] = []
+    for raw in text.splitlines():
+        if not raw:
+            lines.append("")
+            continue
+        expanded = raw.replace("\t", "    ")
+        if len(expanded) <= width:
+            lines.append(expanded)
+            continue
+        chunks = textwrap.wrap(expanded, width=width, replace_whitespace=False,
+                               drop_whitespace=False, break_long_words=True,
+                               break_on_hyphens=False)
+        lines.extend(chunks or [""])
+    return lines or [""]
+
+
+class Tui:
+    """Full-screen alternate-buffer menu for the Shitsuke Toolz CLI."""
+
+    def __init__(self, termios_mod: Any, tty_mod: Any, select_mod: Any) -> None:
+        self.termios = termios_mod
+        self.tty = tty_mod
+        self.select = select_mod
+        self.fd = sys.stdin.fileno()
+        self.saved_term: Any = None
+        self.active = False
+        self.saved_signals: Dict[int, Any] = {}
+        self.stack: List[str] = ["main"]
+        self.selected: Dict[str, int] = {page: 0 for page in TUI_PAGES}
+        self.offset: Dict[str, int] = {page: 0 for page in TUI_PAGES}
+        self.color = bool(COLOR) and not os.environ.get("NO_COLOR") and sys.stdout.isatty()
+
+    def _write(self, text: str) -> None:
+        try:
+            sys.stdout.write(text)
+        except UnicodeEncodeError:
+            sys.stdout.buffer.write(text.encode("utf-8", "replace"))
+        sys.stdout.flush()
+
+    def _c(self, text: str, code: str) -> str:
+        return (code + text + _TUI_RESET) if self.color else text
+
+    def _hide_cursor(self) -> None:
+        self._write("\x1b[?25l")
+
+    def _show_cursor(self) -> None:
+        self._write("\x1b[?25h")
+
+    def _size(self) -> Tuple[int, int]:
+        size = shutil.get_terminal_size(fallback=(80, 24))
+        return max(1, size.lines), max(1, size.columns)
+
+    def _center(self, text: str, width: int) -> str:
+        visible = _tui_visible_len(text)
+        if visible >= width:
+            return _tui_clip(text, width)
+        return " " * ((width - visible) // 2) + text
+
+    def enter(self) -> None:
+        self.saved_term = self.termios.tcgetattr(self.fd)
+        self.tty.setcbreak(self.fd)
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                self.saved_signals[sig] = signal.getsignal(sig)
+                signal.signal(sig, self._signal_exit)
+            except (ValueError, OSError):
+                pass
+        self.active = True
+        atexit.register(self.leave)
+        self._write("\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J")
+
+    def _signal_exit(self, signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt()
+
+    def leave(self) -> None:
+        if not self.active:
+            return
+        self.active = False
+        try:
+            self.termios.tcsetattr(self.fd, self.termios.TCSADRAIN, self.saved_term)
+        except (ValueError, OSError):
+            pass
+        try:
+            self._write(_TUI_RESET + "\x1b[?25h\x1b[?1049l")
+        except OSError:
+            pass
+        for sig, handler in self.saved_signals.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+        self.saved_signals.clear()
+
+    def frame(self, lines: Sequence[str]) -> None:
+        rows, cols = self._size()
+        clipped = [_tui_clip(line, cols) for line in list(lines)[:rows]]
+        while len(clipped) < rows:
+            clipped.append("")
+        self._hide_cursor()
+        out = ["\x1b[H"]
+        for index, line in enumerate(clipped):
+            out.append(line)
+            out.append("\x1b[K")
+            if index < rows - 1:
+                out.append("\r\n")
+        out.append("\x1b[J")
+        self._write("".join(out))
+
+    def _read_key(self) -> str:
+        data = os.read(self.fd, 1)
+        if not data:
+            return "EOF"
+        byte = data[0]
+        if byte == 3:
+            return "CTRL_C"
+        if byte == 4:
+            return "EOF"
+        if byte in (10, 13):
+            return "ENTER"
+        if byte in (8, 127):
+            return "BACKSPACE"
+        if byte == 27:
+            mapping = {
+                b"[A": "UP", b"OA": "UP", b"[B": "DOWN", b"OB": "DOWN",
+                b"[C": "RIGHT", b"OC": "RIGHT", b"[D": "LEFT", b"OD": "LEFT",
+                b"[H": "HOME", b"OH": "HOME", b"[F": "END", b"OF": "END",
+                b"[1~": "HOME", b"[4~": "END", b"[2~": "INSERT",
+                b"[3~": "DELETE", b"[5~": "PGUP", b"[6~": "PGDN",
+            }
+            seq = b""
+            while self.select.select([self.fd], [], [], 0.05)[0]:
+                seq += os.read(self.fd, 1)
+                if seq in mapping or len(seq) >= 6:
+                    break
+            return mapping.get(seq, "ESC")
+        if byte < 0x20:
+            controls = {1: "HOME", 5: "END", 12: "CTRL_L", 21: "CTRL_U", 23: "CTRL_W"}
+            return controls.get(byte, "")
+        if byte < 0x80:
+            return chr(byte)
+        length = 1
+        if byte >> 5 == 0b110:
+            length = 2
+        elif byte >> 4 == 0b1110:
+            length = 3
+        elif byte >> 3 == 0b11110:
+            length = 4
+        raw = data
+        while len(raw) < length:
+            more = os.read(self.fd, 1)
+            if not more:
+                break
+            raw += more
+        return raw.decode("utf-8", "replace")
+
+    def readline_ex(self, prompt: str) -> Optional[str]:
+        rows, cols = self._size()
+        buffer: List[str] = []
+        pos = 0
+        self._show_cursor()
+        while True:
+            rows, cols = self._size()
+            prompt_text = prompt if len(prompt) < cols else prompt[: max(1, cols - 1)]
+            avail = max(1, cols - len(prompt_text) - 2)
+            if len(buffer) <= avail:
+                start = 0
+            else:
+                start = max(0, min(pos - avail // 2, len(buffer) - avail))
+            visible = "".join(buffer[start:start + avail])
+            line = (prompt_text + visible)[: max(1, cols - 1)]
+            self._write("\x1b[%d;1H\x1b[K%s" % (rows, line))
+            col = min(cols, 1 + len(prompt_text) + (pos - start))
+            self._write("\x1b[%d;%dH" % (rows, max(1, col)))
+            key = self._read_key()
+            if key == "ENTER":
+                value = "".join(buffer)
+                self._write("\x1b[%d;1H\x1b[K" % rows)
+                self._hide_cursor()
+                return value
+            if key in ("ESC", "EOF"):
+                self._write("\x1b[%d;1H\x1b[K" % rows)
+                self._hide_cursor()
+                return None
+            if key == "CTRL_C":
+                self._write("\x1b[%d;1H\x1b[K" % rows)
+                self._hide_cursor()
+                raise KeyboardInterrupt()
+            if key == "BACKSPACE":
+                if pos > 0:
+                    buffer.pop(pos - 1)
+                    pos -= 1
+            elif key == "DELETE":
+                if pos < len(buffer):
+                    buffer.pop(pos)
+            elif key == "LEFT":
+                pos = max(0, pos - 1)
+            elif key == "RIGHT":
+                pos = min(len(buffer), pos + 1)
+            elif key == "HOME":
+                pos = 0
+            elif key == "END":
+                pos = len(buffer)
+            elif key == "CTRL_U":
+                buffer = []
+                pos = 0
+            elif key == "CTRL_W":
+                while pos > 0 and buffer[pos - 1].isspace():
+                    buffer.pop(pos - 1)
+                    pos -= 1
+                while pos > 0 and not buffer[pos - 1].isspace():
+                    buffer.pop(pos - 1)
+                    pos -= 1
+            elif key == "TAB":
+                for _ in range(4):
+                    buffer.insert(pos, " ")
+                    pos += 1
+            elif key == "INSERT" or key in ("UP", "DOWN", "PGUP", "PGDN", "CTRL_L"):
+                continue
+            elif key and key.isprintable():
+                buffer.insert(pos, key)
+                pos += len(key)
+
+    def _input(self, title: str, label: str, default: str = "",
+               required: bool = False, hint: str = "") -> Optional[str]:
+        while True:
+            rows, cols = self._size()
+            lines = [""]
+            if rows >= 12:
+                lines.extend([self._c("SHITSUKE", _TUI_BOLD + _TUI_CYAN), ""])
+            lines.append(self._c(_tui_plain_clip(title, cols), _TUI_BOLD))
+            lines.append("")
+            lines.append(self._c(_tui_plain_clip(label, cols), _TUI_CYAN))
+            if hint:
+                lines.append(self._c(_tui_plain_clip(hint, cols), _TUI_DIM))
+            if default:
+                lines.append(self._c("default: " + default, _TUI_DIM))
+            lines.append("")
+            lines.append(self._c("Enter confirm · Esc cancel · Ctrl+C quit", _TUI_DIM))
+            self.frame(lines)
+            value = self.readline_ex("> ")
+            if value is None:
+                return None
+            value = value.strip()
+            if value:
+                return value
+            if default:
+                return default
+            if not required:
+                return ""
+            self.wait_message("This field is required.", title)
+
+    def _choose(self, title: str, label: str, choices: Sequence[str],
+                default: str, hint: str = "") -> Optional[str]:
+        choices = list(choices)
+        if default not in choices:
+            default = choices[0]
+        while True:
+            rows, cols = self._size()
+            lines = [""]
+            if rows >= 14:
+                lines.extend([self._c("SHITSUKE", _TUI_BOLD + _TUI_CYAN), ""])
+            lines.append(self._c(_tui_plain_clip(title, cols), _TUI_BOLD))
+            lines.append("")
+            lines.append(self._c(_tui_plain_clip(label, cols), _TUI_CYAN))
+            if hint:
+                lines.append(self._c(_tui_plain_clip(hint, cols), _TUI_DIM))
+            lines.append("")
+            for index, choice in enumerate(choices, 1):
+                marker = ">" if choice == default else " "
+                lines.append("  %s [%d] %s" % (marker, index, _tui_plain_clip(choice, max(1, cols - 7))))
+            lines.append("")
+            lines.append(self._c("Enter accepts default · Esc cancel", _TUI_DIM))
+            self.frame(lines)
+            value = self.readline_ex("> ")
+            if value is None:
+                return None
+            value = value.strip()
+            if not value:
+                return default
+            if value in choices:
+                return value
+            if value.isdigit() and 1 <= int(value) <= len(choices):
+                return choices[int(value) - 1]
+            self.wait_message("Invalid choice: %s" % value, title)
+
+    def _confirm(self, title: str, label: str, default: bool = False,
+                 hint: str = "") -> Optional[bool]:
+        value = self._input(title, label + " [y/n]", "y" if default else "n", False, hint)
+        if value is None:
+            return None
+        return value.strip().lower() in ("y", "yes", "1", "true")
+
+    def collect(self, title: str, specs: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+        values: Dict[str, Any] = {}
+        for spec in specs:
+            key = str(spec["key"])
+            label = str(spec["label"])
+            default = spec.get("default", "")
+            hint = str(spec.get("hint", ""))
+            if spec.get("choices"):
+                choices = list(spec["choices"])
+                value = self._choose(title, label, choices, str(spec.get("default", choices[0])), hint)
+            elif spec.get("bool"):
+                value = self._confirm(title, label, bool(spec.get("default", False)), hint)
+            else:
+                value = self._input(title, label, str(default), bool(spec.get("required", False)), hint)
+            if value is None:
+                return None
+            values[key] = value
+        return values
+
+    def wait_message(self, text: str, title: str) -> None:
+        rows, cols = self._size()
+        lines = [
+            "",
+            self._c(_tui_plain_clip(title, cols), _TUI_BOLD),
+            "",
+            self._c(_tui_plain_clip(text, cols), _TUI_YELLOW),
+            "",
+            self._c("press any key", _TUI_DIM),
+        ]
+        self.frame(lines)
+        key = self._read_key()
+        if key == "CTRL_C":
+            raise KeyboardInterrupt()
+
+    def _p(self, value: str) -> str:
+        if not value:
+            return value
+        return os.path.expandvars(os.path.expanduser(value))
+
+    def run_cli(self, argv: Sequence[str], title: str) -> None:
+        self.frame(["", self._c("Running " + title + " ...", _TUI_CYAN), ""])
+        buffer = io.StringIO()
+        global COLOR, JSON_MODE, VERBOSE
+        saved = (COLOR, JSON_MODE, VERBOSE)
+        COLOR = False
+        JSON_MODE = False
+        VERBOSE = False
+        rc = 0
+        try:
+            with redirect_stdout(buffer), redirect_stderr(buffer):
+                args = make_parser().parse_args(list(argv))
+                handler = DISPATCH.get(args.cmd)
+                if handler is None:
+                    raise UsageError("cli", "unknown command: %s" % args.cmd)
+                rc = int(handler(args) or EXIT_OK)
+        except ShitsukeError as exc:
+            rc = exc.code
+            buffer.write("%s: %s\n" % (exc.subsystem, exc))
+        except KeyboardInterrupt:
+            raise
+        except SystemExit as exc:
+            rc = int(exc.code or 0)
+        except Exception as exc:
+            rc = 1
+            buffer.write("internal: %s: %s\n" % (type(exc).__name__, exc))
+        finally:
+            COLOR, JSON_MODE, VERBOSE = saved
+        text = _TUI_ANSI_RE.sub("", buffer.getvalue()).strip("\n")
+        header = "$ shitsuke_toolz " + " ".join(shlex.quote(str(arg)) for arg in argv)
+        body = header + "\n" + "-" * min(len(header), 72) + "\n"
+        body += (text if text else "(no output)") + "\n\n[exit %d]" % rc
+        self.pager(title, body)
+
+    def pager(self, title: str, text: str) -> None:
+        text = _TUI_ANSI_RE.sub("", text)
+        offset = 0
+        cached_width = 0
+        lines: List[str] = []
+        while True:
+            rows, cols = self._size()
+            width = max(10, cols - 2)
+            if width != cached_width:
+                lines = _tui_wrap(text, width)
+                cached_width = width
+            body_h = max(1, rows - 3)
+            max_offset = max(0, len(lines) - body_h)
+            offset = max(0, min(offset, max_offset))
+            header = self._c(_tui_plain_clip(title, cols), _TUI_BOLD + _TUI_CYAN)
+            view = lines[offset:offset + body_h]
+            screen: List[str] = [header, ""] + list(view)
+            while len(screen) < rows - 1:
+                screen.append("")
+            screen = screen[: max(1, rows - 1)]
+            info = " %d-%d/%d" % (offset + 1 if lines else 0,
+                                  min(len(lines), offset + body_h), len(lines))
+            footer = "↑/↓ scroll · PgUp/PgDn · q back" + info
+            screen.append(self._c(_tui_plain_clip(footer, cols), _TUI_DIM))
+            self.frame(screen)
+            key = self._read_key()
+            if key in ("UP", "k"):
+                offset -= 1
+            elif key in ("DOWN", "j"):
+                offset += 1
+            elif key == "PGUP":
+                offset -= body_h
+            elif key == "PGDN":
+                offset += body_h
+            elif key in ("HOME", "g"):
+                offset = 0
+            elif key in ("END", "G"):
+                offset = max_offset
+            elif key in ("q", "ESC", "ENTER", "LEFT", "BACKSPACE"):
+                return
+            elif key == "CTRL_C":
+                raise KeyboardInterrupt()
+            elif key == "EOF":
+                return
+
+    def _banner_lines(self, rows: int, cols: int) -> List[str]:
+        if cols >= 72 and rows >= 20:
+            return list(TUI_BANNER_FULL)
+        if cols >= 40:
+            return list(TUI_BANNER_COMPACT)
+        return ["\u2588 SHITSUKE \u2588"]
+
+    def _header(self, page: str, title: str, rows: int, cols: int) -> List[str]:
+        if rows < 10:
+            return ["", self._c(_tui_plain_clip("SHITSUKE · " + title, cols), _TUI_BOLD + _TUI_CYAN)]
+        if page == "main":
+            art = self._banner_lines(rows, cols)
+            lines = [""]
+            lines.extend(self._center(line, cols) for line in art)
+            if rows >= 16:
+                lines.extend(["", self._center(self._c("VIP Toolkit For Devs (beta)", _TUI_DIM), cols), ""])
+            else:
+                lines.append("")
+            return lines
+        trail = " › ".join(TUI_PAGES[item][0] for item in self.stack)
+        return [
+            "",
+            self._c("SHITSUKE", _TUI_BOLD + _TUI_CYAN) + "  " + self._c(trail, _TUI_DIM),
+            "",
+        ]
+
+    def _footer(self, page: str, index: int, total: int, visible: int) -> str:
+        rows, cols = self._size()
+        limit = min(9, total)
+        if page == "main":
+            hint = "↑/↓ move · Enter select · 1-%d jump · q quit" % limit
+        else:
+            hint = "↑/↓ move · Enter select · 1-%d jump · q back · ? keys" % limit
+        if total > visible:
+            hint += " · %d/%d" % (index + 1, total)
+        return self._c(_tui_plain_clip(hint, cols), _TUI_DIM)
+
+    def render_menu(self) -> None:
+        page = self.stack[-1]
+        title, items = TUI_PAGES[page]
+        if not items:
+            return
+        rows, cols = self._size()
+        index = max(0, min(self.selected.get(page, 0), len(items) - 1))
+        self.selected[page] = index
+        header = self._header(page, title, rows, cols)
+        available = max(1, rows - len(header) - 1)
+        show_desc = cols >= 52 and available >= len(items) * 2
+        item_h = 2 if show_desc else 1
+        visible = max(1, available // item_h)
+        if visible >= len(items):
+            start = 0
+        else:
+            start = max(0, min(self.offset.get(page, 0), len(items) - visible))
+            if index < start:
+                start = index
+            elif index >= start + visible:
+                start = index - visible + 1
+            self.offset[page] = start
+        body: List[str] = list(header)
+        for item_index in range(start, min(len(items), start + visible)):
+            label, desc, _target = items[item_index]
+            text = "[%d] %s" % (item_index + 1, label)
+            if item_index == index:
+                body.append(self._c("> " + _tui_plain_clip(text, max(1, cols - 2)), _TUI_BOLD + _TUI_CYAN))
+            else:
+                body.append("  " + _tui_plain_clip(text, max(1, cols - 2)))
+            if show_desc and desc:
+                body.append("      " + self._c(_tui_plain_clip(desc, max(1, cols - 6)), _TUI_DIM))
+        max_rows = max(1, rows - 1)
+        body = body[:max_rows]
+        while len(body) < max_rows:
+            body.append("")
+        body.append(self._footer(page, index, len(items), visible))
+        self.frame(body)
+
+    def activate(self, item: Tuple[str, str, str]) -> None:
+        target = item[2]
+        if target in TUI_PAGES:
+            self.stack.append(target)
+            self.selected.setdefault(target, 0)
+            self.offset.setdefault(target, 0)
+            return
+        method = getattr(self, target, None)
+        if method is None:
+            self.pager("Missing action", "No handler registered for %s" % target)
+            return
+        method()
+
+    def show_keys(self) -> None:
+        self.pager("Keys", (
+            "Navigation\n"
+            "  Up/Down or k/j     move\n"
+            "  Enter or Right     open / run\n"
+            "  Left, Esc or q     back\n"
+            "  q on the main menu quit\n"
+            "  1-9                jump to an option\n"
+            "  ?                  show this screen\n"
+            "\n"
+            "Text prompts\n"
+            "  Enter              confirm\n"
+            "  Esc                cancel the action\n"
+            "  Ctrl+U / Ctrl+W    clear line / delete word\n"
+            "  Ctrl+C             quit the app\n"
+            "\n"
+            "Output pager\n"
+            "  Up/Down, PgUp/PgDn scroll\n"
+            "  Home/End           jump\n"
+            "  q or Enter         back\n"
+        ))
+
+    def menu_once(self) -> bool:
+        page = self.stack[-1]
+        items = TUI_PAGES[page][1]
+        if not items:
+            return False
+        index = max(0, min(self.selected.get(page, 0), len(items) - 1))
+        self.selected[page] = index
+        self.render_menu()
+        key = self._read_key()
+        if key == "CTRL_C":
+            raise KeyboardInterrupt()
+        if key == "EOF":
+            return False
+        if key in ("UP", "k"):
+            self.selected[page] = (index - 1) % len(items)
+        elif key in ("DOWN", "j"):
+            self.selected[page] = (index + 1) % len(items)
+        elif key in ("HOME", "g"):
+            self.selected[page] = 0
+        elif key in ("END", "G"):
+            self.selected[page] = len(items) - 1
+        elif key in ("ENTER", "RIGHT"):
+            self.activate(items[index])
+        elif key in ("LEFT", "BACKSPACE", "ESC"):
+            if len(self.stack) > 1:
+                self.stack.pop()
+            else:
+                return False
+        elif key == "q":
+            if len(self.stack) > 1:
+                self.stack.pop()
+            else:
+                return False
+        elif key == "?":
+            self.show_keys()
+        elif len(key) == 1 and key.isdigit() and key != "0":
+            number = int(key)
+            if number <= min(9, len(items)):
+                self.selected[page] = number - 1
+                self.activate(items[number - 1])
+        return True
+
+    def run(self) -> int:
+        try:
+            self.enter()
+            while self.menu_once():
+                pass
+            return EXIT_OK
+        except KeyboardInterrupt:
+            return 130
+        finally:
+            self.leave()
+
+    def act_recon(self) -> None:
+        value = self.collect("Target Recon", [
+            {"key": "path", "label": "Directory to scan", "default": ".", "required": True},
+        ])
+        if value is not None:
+            self.run_cli(["recon", self._p(value["path"])], "Target Recon")
+
+    def act_elf(self) -> None:
+        value = self.collect("ELF Header", [
+            {"key": "path", "label": "ELF file", "required": True},
+        ])
+        if value is not None:
+            self.run_cli(["elf", self._p(value["path"])], "ELF Header")
+
+    def act_metadata(self) -> None:
+        value = self.collect("Metadata", [
+            {"key": "path", "label": "global-metadata.dat", "required": True},
+            {"key": "recover", "label": "Run the recovery ladder?", "bool": True, "default": False},
+            {"key": "export", "label": "Export directory (blank = skip)", "required": False},
+            {"key": "frida", "label": "Frida dumper script path (blank = skip)", "required": False},
+        ])
+        if value is None:
+            return
+        argv = ["metadata", self._p(value["path"])]
+        if value["recover"]:
+            argv.append("--recover")
+        if value["export"]:
+            argv.extend(["--export", self._p(value["export"])])
+        if value["frida"]:
+            argv.extend(["--frida-out", self._p(value["frida"])])
+        self.run_cli(argv, "Metadata")
+
+    def act_scan(self) -> None:
+        value = self.collect("AOB Scan", [
+            {"key": "path", "label": "File to scan", "required": True},
+            {"key": "pattern", "label": "Pattern", "default": "48 8B ?? 90", "required": True},
+            {"key": "context", "label": "Context bytes", "default": "16"},
+        ])
+        if value is not None:
+            self.run_cli(["scan", self._p(value["path"]), "--pattern", value["pattern"],
+                          "--context", value["context"]], "AOB Scan")
+
+    def act_strings(self) -> None:
+        value = self.collect("Strings", [
+            {"key": "path", "label": "Binary or text file", "required": True},
+            {"key": "min", "label": "Minimum length", "default": "4"},
+            {"key": "out", "label": "Output directory (blank = stdout)", "required": False},
+        ])
+        if value is None:
+            return
+        argv = ["strings", self._p(value["path"]), "--min", value["min"]]
+        if value["out"]:
+            argv.extend(["--out", self._p(value["out"])])
+        self.run_cli(argv, "Strings")
+
+    def act_assets(self) -> None:
+        value = self.collect("Asset Index", [
+            {"key": "root", "label": "Game files / dragon2017 / assets root", "required": True},
+            {"key": "mini", "label": "mini_patch override (blank = auto)", "required": False},
+            {"key": "out", "label": "Output directory (blank = stdout)", "required": False},
+        ])
+        if value is None:
+            return
+        argv = ["assets", "--root", self._p(value["root"])]
+        if value["mini"]:
+            argv.extend(["--mini-patch", self._p(value["mini"])])
+        if value["out"]:
+            argv.extend(["--out", self._p(value["out"])])
+        self.run_cli(argv, "Asset Index")
+
+    def act_unityfs(self) -> None:
+        value = self.collect("UnityFS", [
+            {"key": "path", "label": "UnityFS bundle", "required": True},
+            {"key": "serialized", "label": "Parse SerializedFile nodes?", "bool": True, "default": True},
+            {"key": "extract", "label": "Extract nodes to (blank = skip)", "required": False},
+        ])
+        if value is None:
+            return
+        argv = ["unityfs", self._p(value["path"])]
+        if value["serialized"]:
+            argv.append("--serialized")
+        if value["extract"]:
+            argv.extend(["--extract", self._p(value["extract"])])
+        self.run_cli(argv, "UnityFS")
+
+    def act_skin(self) -> None:
+        value = self.collect("Skin Swap", [
+            {"key": "source", "label": "Source skin directory or file", "required": True},
+            {"key": "target", "label": "Target asset directory", "required": True},
+            {"key": "prefix", "label": "Asset prefix (blank = use hero)", "required": False,
+             "hint": "Example: hero_fanny"},
+            {"key": "hero", "label": "Hero name (blank = use prefix)", "required": False,
+             "hint": "Example: Fanny"},
+            {"key": "apply", "label": "Apply changes and write restore.py?", "bool": True, "default": False},
+            {"key": "out", "label": "Backup/plan directory (blank = default)", "required": False},
+            {"key": "sync", "label": "Mirror into mini_patch?", "bool": True, "default": False},
+        ])
+        if value is None:
+            return
+        if not value["prefix"] and not value["hero"]:
+            self.wait_message("Enter a prefix or a hero name.", "Skin Swap")
+            return
+        argv = ["skin", "--source", self._p(value["source"]), "--target", self._p(value["target"])]
+        if value["prefix"]:
+            argv.extend(["--prefix", value["prefix"]])
+        if value["hero"]:
+            argv.extend(["--hero", value["hero"]])
+        if value["apply"]:
+            argv.append("--apply")
+        if value["out"]:
+            argv.extend(["--out", self._p(value["out"])])
+        if value["sync"]:
+            argv.append("--sync-mini-patch")
+        self.run_cli(argv, "Skin Swap")
+
+    def act_alias(self) -> None:
+        value = self.collect("Alias Inject", [
+            {"key": "path", "label": "UnityFS bundle", "required": True},
+            {"key": "aliases", "label": "Alias paths", "required": True,
+             "hint": "Space or comma separated, e.g. _skin_ _skin01_"},
+            {"key": "set_name", "label": "New bundle name (blank = keep)", "required": False},
+            {"key": "output", "label": "Output bundle (blank = *.patched)", "required": False},
+            {"key": "sync", "label": "Mirror into mini_patch?", "bool": True, "default": False},
+            {"key": "asset_root", "label": "Assets root for mirror mapping (blank = auto)", "required": False},
+        ])
+        if value is None:
+            return
+        aliases = [item for item in re.split(r"[\s,]+", value["aliases"].strip()) if item]
+        if not aliases:
+            self.wait_message("Enter at least one alias.", "Alias Inject")
+            return
+        argv = ["alias", self._p(value["path"]), "--aliases"] + aliases
+        if value["set_name"]:
+            argv.extend(["--set-name", value["set_name"]])
+        if value["output"]:
+            argv.extend(["--output", self._p(value["output"])])
+        if value["sync"]:
+            argv.append("--sync-mini-patch")
+        if value["asset_root"]:
+            argv.extend(["--asset-root", self._p(value["asset_root"])])
+        self.run_cli(argv, "Alias Inject")
+
+    def act_resmap(self) -> None:
+        mode = self._choose("Resmap", "Mode", ["list", "edit", "restore"], "list")
+        if mode is None:
+            return
+        specs: List[Dict[str, Any]] = [
+            {"key": "path", "label": "mulonggame_table_1 file or directory", "required": True},
+        ]
+        if mode == "edit":
+            specs.extend([
+                {"key": "index", "label": "Record index", "default": "0", "required": True},
+                {"key": "skin_id", "label": "New skin id", "required": True},
+            ])
+        value = self.collect("Resmap", specs)
+        if value is None:
+            return
+        argv = ["resmap", self._p(value["path"])]
+        if mode == "edit":
+            argv.extend(["--index", value["index"], "--skin-id", value["skin_id"]])
+        elif mode == "restore":
+            argv.append("--restore")
+        self.run_cli(argv, "Resmap")
+
+    def _xmljson(self, kind: str) -> None:
+        title = kind.upper() + " Tools"
+        mode = self._choose(title, "Mode", ["pretty", "diff", "merge", "validate"], "pretty")
+        if mode is None:
+            return
+        specs: List[Dict[str, Any]] = [
+            {"key": "a", "label": "Primary file", "required": True},
+            {"key": "b", "label": "Secondary file", "required": mode in ("diff", "merge")},
+            {"key": "out", "label": "Output path (blank = stdout)", "required": False},
+            {"key": "schema", "label": "Schema file (blank = skip)", "required": False},
+        ]
+        if kind == "xml":
+            specs.append({"key": "no_comments", "label": "Drop comments when pretty-printing?", "bool": True, "default": False})
+        value = self.collect(title, specs)
+        if value is None:
+            return
+        if mode in ("diff", "merge") and not value["b"]:
+            self.wait_message("This mode needs a secondary file.", title)
+            return
+        argv = [kind, mode, self._p(value["a"])]
+        if value["b"]:
+            argv.append(self._p(value["b"]))
+        if value["out"]:
+            argv.extend(["--out", self._p(value["out"])])
+        if value["schema"]:
+            argv.extend(["--schema", self._p(value["schema"])])
+        if kind == "xml" and mode == "pretty" and value["no_comments"]:
+            argv.append("--no-comments")
+        self.run_cli(argv, title)
+
+    def act_xml(self) -> None:
+        self._xmljson("xml")
+
+    def act_json(self) -> None:
+        self._xmljson("json")
+
+    def act_gen(self) -> None:
+        kind = self._choose("Generate Template", "Kind", ["lua", "frida", "cpp", "python"], "lua")
+        if kind is None:
+            return
+        defaults = {"lua": "gg_scan", "frida": "hook_method", "cpp": "stub", "python": "aob_scan"}
+        hints = {
+            "lua": "gg_scan, pointer_chain, offset_patch, aob_scan, cooldown_timer, config_loader",
+            "frida": "metadata_dump, module_resolve, il2cpp_bridge, hook_method, aob_scan",
+            "cpp": "stub",
+            "python": "elf_reader, metadata_header, unityfs_reader, aob_scan",
+        }
+        template = self._input("Generate Template", "Template name", defaults[kind], True, hints[kind])
+        if template is None:
+            return
+        name = self._input("Generate Template", "Symbol/name override (blank = default)", "", False)
+        if name is None:
+            return
+        out = self._input("Generate Template", "Output directory (blank = stdout)", "", False)
+        if out is None:
+            return
+        argv = ["gen", kind, template]
+        if name:
+            argv.extend(["--name", name])
+        if out:
+            argv.extend(["--out", self._p(out)])
+        self.run_cli(argv, "Generate Template")
+
+    def act_map(self) -> None:
+        mode = self._choose("Surface Map", "Match mode", ["substring", "exact", "regex"], "substring")
+        if mode is None:
+            return
+        value = self.collect("Surface Map", [
+            {"key": "binary", "label": "Binary file or directory", "required": True},
+            {"key": "keywords", "label": "Keyword file", "required": True},
+            {"key": "out", "label": "Output directory (blank = stdout)", "required": False},
+            {"key": "frida", "label": "Emit a runtime resolver script?", "bool": True, "default": False},
+        ])
+        if value is None:
+            return
+        argv = ["map", "--binary", self._p(value["binary"]), "--keywords", self._p(value["keywords"])]
+        if mode == "exact":
+            argv.append("--exact")
+        elif mode == "regex":
+            argv.append("--regex")
+        if value["out"]:
+            argv.extend(["--out", self._p(value["out"])])
+        if value["frida"]:
+            argv.append("--frida-emit")
+        self.run_cli(argv, "Surface Map")
+
+    def act_adb_devices(self) -> None:
+        self._adb("devices")
+
+    def act_adb_shell(self) -> None:
+        self._adb("shell")
+
+    def act_adb_push(self) -> None:
+        self._adb("push")
+
+    def act_adb_pull(self) -> None:
+        self._adb("pull")
+
+    def act_adb_logcat(self) -> None:
+        self._adb("logcat")
+
+    def act_adb_pidof(self) -> None:
+        self._adb("pidof")
+
+    def act_adb_dumpsys(self) -> None:
+        self._adb("dumpsys")
+
+    def act_adb_bugreport(self) -> None:
+        self._adb("bugreport")
+
+    def act_adb_wireless(self) -> None:
+        self._adb("wireless")
+
+    def _adb(self, action: str) -> None:
+        title = "ADB " + action.title()
+        serial = {"key": "serial", "label": "Device serial (blank = default)", "required": False}
+        specs: List[Dict[str, Any]] = [dict(serial)]
+        if action == "shell":
+            specs.append({"key": "command", "label": "Shell command", "required": True,
+                          "hint": "Example: getprop ro.product.cpu.abi"})
+        elif action in ("push", "pull"):
+            specs.extend([
+                {"key": "src", "label": "Source path", "required": True},
+                {"key": "dst", "label": "Destination path", "required": True},
+            ])
+        elif action == "logcat":
+            specs.extend([
+                {"key": "tag", "label": "Tag filter (blank = none)", "required": False},
+                {"key": "pid", "label": "PID filter (blank = none)", "required": False},
+                {"key": "regex", "label": "Regex filter (blank = none)", "required": False},
+                {"key": "tail", "label": "Tail line count (blank = none)", "required": False},
+                {"key": "duration", "label": "Duration seconds (blank = none)", "required": False},
+                {"key": "out", "label": "Output file (blank = stdout)", "required": False},
+            ])
+        elif action == "dumpsys":
+            specs.append({"key": "what", "label": "Dump target", "choices": ["package", "window"], "default": "package"})
+        elif action == "bugreport":
+            specs.append({"key": "output", "label": "Output path (blank = default)", "required": False})
+        elif action == "wireless":
+            specs.append({"key": "mode", "label": "Action", "choices": ["steps", "pair", "connect"], "default": "steps"})
+        value = self.collect(title, specs)
+        if value is None:
+            return
+        base = ["adb"]
+        if value.get("serial"):
+            base.extend(["--device", value["serial"]])
+        argv = base + [action]
+        if action == "shell":
+            try:
+                command = shlex.split(value["command"])
+            except ValueError as exc:
+                self.wait_message("Invalid command: %s" % exc, title)
+                return
+            if not command:
+                self.wait_message("Enter a command.", title)
+                return
+            argv.extend(command)
+        elif action in ("push", "pull"):
+            if action == "push":
+                argv.extend([self._p(value["src"]), value["dst"]])
+            else:
+                argv.extend([value["src"], self._p(value["dst"])])
+        elif action == "logcat":
+            for key, flag in (("tag", "--tag"), ("pid", "--pid"), ("regex", "--regex"),
+                              ("tail", "--tail"), ("duration", "--duration")):
+                if value[key]:
+                    argv.extend([flag, value[key]])
+            if value["out"]:
+                argv.extend(["--output", self._p(value["out"])])
+        elif action == "dumpsys":
+            argv.append(value["what"])
+        elif action == "bugreport" and value["output"]:
+            argv.extend(["--output", self._p(value["output"])])
+        elif action == "wireless":
+            if value["mode"] == "steps":
+                pass
+            elif value["mode"] == "pair":
+                host = self._input(title, "Pair host:port", "", True)
+                if host is None:
+                    return
+                code = self._input(title, "Pairing code", "", True)
+                if code is None:
+                    return
+                argv.extend(["--pair", host, "--code", code])
+            else:
+                host = self._input(title, "Connect host:port", "", True)
+                if host is None:
+                    return
+                argv.extend(["--connect", host])
+        self.run_cli(argv, title)
+
+    def act_shizuku(self) -> None:
+        value = self.collect("Shizuku Probe", [
+            {"key": "serial", "label": "Device serial (blank = default)", "required": False},
+        ])
+        if value is None:
+            return
+        argv = ["shizuku"]
+        if value["serial"]:
+            argv.extend(["--device", value["serial"]])
+        self.run_cli(argv, "Shizuku Probe")
+
+    def act_menu(self) -> None:
+        value = self.collect("Mod Menu Scaffold", [
+            {"key": "pkg", "label": "Package root", "default": "com.android.support", "required": True},
+            {"key": "out", "label": "Output directory", "default": "modmenu", "required": True},
+            {"key": "dry", "label": "Dry run only?", "bool": True, "default": False},
+        ])
+        if value is None:
+            return
+        argv = ["menu", "--pkg", value["pkg"], "--out", self._p(value["out"])]
+        if value["dry"]:
+            argv.append("--dry-run")
+        self.run_cli(argv, "Mod Menu Scaffold")
+
+    def act_banner(self) -> None:
+        body = (BANNER_ART.strip("\n") + "\n" + BANNER_LINE + "\n\n"
+                + "Shitsuke Toolz %s\n" % TOOL_VERSION
+                + "Target: %s  Assets: %s\n" % (APP_PKG, ASSET_ROOT))
+        self.pager("Banner", body)
+
+    def act_selftest(self) -> None:
+        self.frame(["", self._c("Running selftest ...", _TUI_CYAN), ""])
+        buffer = io.StringIO()
+        global COLOR
+        saved = COLOR
+        COLOR = False
+        try:
+            with redirect_stdout(buffer), redirect_stderr(buffer):
+                rc = run_selftest()
+        finally:
+            COLOR = saved
+        text = buffer.getvalue().strip("\n")
+        self.pager("Selftest", text + "\n\n[exit %d]" % rc)
+
+    def act_help(self) -> None:
+        self.pager("CLI Help", make_parser().format_help())
+
+    def act_about(self) -> None:
+        self.pager("About", (
+            "Shitsuke Toolz %s\n"
+            "VIP Toolkit For Devs (beta)\n\n"
+            "Target: %s\n"
+            "Unity/IL2CPP · asset root %s\n"
+            "No network access · optional deps fall back cleanly\n\n"
+            "This menu runs in an alternate terminal buffer and restores the\n"
+            "previous screen when you quit. The CLI remains available:\n"
+            "  python shitsuke_toolz.py --help\n" % (TOOL_VERSION, APP_PKG, ASSET_ROOT)
+        ))
+
+
+def run_tui() -> int:
+    """Launch the interactive terminal UI."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise UsageError("tui", "interactive mode requires a TTY; use --help for CLI usage")
+    try:
+        import select as select_mod
+        import termios as termios_mod
+        import tty as tty_mod
+    except ImportError:
+        raise UsageError("tui", "interactive mode requires a POSIX terminal")
+    return Tui(termios_mod, tty_mod, select_mod).run()
 
 # 99 dispatch/main
 def _write_bytes(args: argparse.Namespace, path: Union[str, Path], data: bytes) -> Optional[Path]:
@@ -7281,8 +8431,13 @@ def cmd_map(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_tui(args: argparse.Namespace) -> int:
+    return run_tui()
+
+
 DISPATCH: Dict[str, Callable[[argparse.Namespace], int]] = {
     "banner": cmd_banner,
+    "tui": cmd_tui,
     "recon": cmd_recon,
     "elf": cmd_elf,
     "metadata": cmd_metadata,
@@ -7315,10 +8470,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entry point: banner, parse, dispatch, and map failures to exit codes."""
     global COLOR, VERBOSE, JSON_MODE
     _install_signal_handlers()
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if ((not raw_argv) or raw_argv == ["tui"]) and sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            return run_tui()
+        except UsageError as exc:
+            err(exc.subsystem, str(exc))
+            return EXIT_USAGE
     print_banner()
     try:
         parser = make_parser()
-        args = parser.parse_args(list(argv) if argv is not None else None)
+        args = parser.parse_args(raw_argv)
     except UsageError as exc:
         err(exc.subsystem, str(exc))
         return EXIT_USAGE

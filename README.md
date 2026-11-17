@@ -21,6 +21,7 @@ Built for modders, exploit devs, and reverse engineers. One file. No placeholder
 - **Device** — ADB wrapper, Shizuku probe, env/path resolver, wireless ADB helper.
 - **Mod Menu Scaffold** — full LGLTeam-style Android mod menu source tree emitter with manifest.
 - **Surface Map** — keyword-driven CSV/JSON mapping across strings, symbols, metadata, assets.
+- **Interactive UI** — run with no arguments for a full-screen arrow-key menu with clean alternate-screen exit.
 - **Self-Test** — `--selftest` exercises every subsystem against synthetic fixtures.
 
 ## Setup Guide
@@ -40,7 +41,7 @@ cd shitsuke_toolz
 python shitsuke_toolz.py --selftest
 ```
 
-Expected result: `selftest: 21 passed, 0 failed` and exit code `0`.
+Expected result: `selftest: 22 passed, 0 failed` and exit code `0`.
 
 3. Give Termux access to shared storage, then point the tool at the game files:
 
@@ -114,9 +115,22 @@ Use `adb pull` (from a host or Termux) to copy game files into UserLAnd's home d
 | LZ4 decompression is slow | Optional: `pip install lz4`; without it the pure-Python fallback is used. |
 | `No module named lz4` / `frida` | Both are optional and handled automatically. |
 
+## Interactive UI
+
+Run the tool with no arguments on a terminal:
+
+```bash
+python shitsuke_toolz.py
+```
+
+Use `Up`/`Down` or `j`/`k` to move, `Enter`/`Right` to open, and `q`/`Esc` to go back. On the main menu `q` quits. Number keys jump straight to an option. The menu uses an alternate terminal screen, so quitting restores your shell exactly as it was — no leftover text.
+
+Actions prompt for their inputs inside the UI, then show output in a scrollable pager (`q` or `Enter` returns). The full CLI stays available for scripts. The same screen launches with `python shitsuke_toolz.py tui`.
+
 ## Quick Start
 
 ```bash
+python shitsuke_toolz.py            # interactive TUI
 python shitsuke_toolz.py --selftest
 python shitsuke_toolz.py banner
 python shitsuke_toolz.py elf libil2cpp.so
@@ -127,7 +141,7 @@ python shitsuke_toolz.py scan file.bin --pattern "48 8B ?? 90"
 ## CLI
 
 ```text
-shitsuke_toolz.py {banner,recon,elf,metadata,scan,strings,assets,unityfs,skin,alias,resmap,xml,json,gen,adb,shizuku,menu,map,selftest}
+shitsuke_toolz.py {banner,tui,recon,elf,metadata,scan,strings,assets,unityfs,skin,alias,resmap,xml,json,gen,adb,shizuku,menu,map,selftest}
 ```
 
 Global flags: `--verbose --json --out DIR --adb PATH --device SERIAL --no-color --dry-run --force --selftest`
